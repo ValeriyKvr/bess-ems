@@ -102,6 +102,15 @@ class SimulationClock:
         self._last_day = self._current_time.date()
         logger.info("Simulation clock jumped to %s", self.now_iso())
 
+        # Notify tick callbacks of immediate jump
+        for cb in self._tick_callbacks:
+            try:
+                res = cb(self._current_time, 0.0)
+                if asyncio.iscoroutine(res):
+                    asyncio.create_task(res)
+            except Exception as e:
+                logger.error("Error in clock tick callback on jump: %s", e)
+
     def reset(self, scenario: str = "default", custom_time: datetime | str | None = None) -> None:
         """Reset clock to scenario preset or custom timestamp."""
         if custom_time:

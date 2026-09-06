@@ -68,8 +68,8 @@ class BessSimulatorApp:
 
         # Calculate simulation dt elapsed since previous tick
         dt_seconds = (current_sim_dt - self.last_sim_datetime).total_seconds()
-        if dt_seconds <= 0:
-            # First tick or reset
+        if dt_seconds <= 0 or dt_seconds > 3600.0:
+            # First tick, clock jump or reset: clamp to standard 60s step
             dt_seconds = 60.0
 
         self.last_sim_datetime = current_sim_dt
@@ -81,7 +81,8 @@ class BessSimulatorApp:
     def on_setpoint(self, payload: dict[str, Any]) -> None:
         """Handle active power setpoint dispatched from EMS (SPEC §4.3)."""
         try:
-            setpoint = float(payload.get("setpoint_kw", 0.0))
+            setpoint_val = payload.get("setpoint_kw", payload.get("power_kw", 0.0))
+            setpoint = float(setpoint_val)
             reason = payload.get("reason", "manual")
             logger.info("New setpoint: %.2f kW (reason: %s)", setpoint, reason)
             self.current_setpoint_kw = setpoint

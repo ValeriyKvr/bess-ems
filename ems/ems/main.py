@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+import math
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI
@@ -22,7 +23,12 @@ from ems.db.models import Schedule as ScheduleModel
 from ems.db.session import async_session_factory, engine
 from ems.dispatch.dispatcher import Dispatcher, DispatcherConfig
 from ems.market.financials import compute_hourly_financials, record_hourly_financials
-from ems.market.simulator import MarketSimulator, calculate_buy_price, calculate_sell_price
+from ems.market.simulator import (
+    MarketSimulator,
+    MarketTariffs,
+    calculate_buy_price,
+    calculate_sell_price,
+)
 from ems.mqtt.client import EmsMqttClient
 from ems.optimization.strategies import (
     Schedule,
@@ -49,9 +55,76 @@ class ApplicationState:
         self._strategy_name: str = "ARBITRAGE"
         self._n_charge_hours: int = 4
         self._n_discharge_hours: int = 4
+        self._price_cache: dict[datetime, float] = {}
+        self._load_cache: dict[datetime, tuple[float, float]] = {}
+        self._current_sim_date: date | None = None
+        self._today_net_uah: float = 0.0
+        self._today_baseline_uah: float = 0.0
 
 
 app_state = ApplicationState()
+
+
+async def preload_telemetry_cache(target_dt: datetime) -> None:
+    """Preload prices and site loads into memory cache for smooth real-time ticks."""
+    try:
+        start_range = (target_dt - timedelta(days=1)).replace(minute=0, second=0, microsecond=0)
+        end_range = (target_dt + timedelta(days=2)).replace(minute=0, second=0, microsecond=0)
+
+        async with async_session_factory() as session:
+            # 1. Fetch DAM prices
+            p_stmt = select(DamPrice.ts, DamPrice.price_uah_mwh).where(
+                DamPrice.ts >= start_range, DamPrice.ts <= end_range
+            )
+            p_res = await session.execute(p_stmt)
+            for ts, price in p_res.all():
+                app_state._price_cache[ts] = float(price)
+
+            # 2. Fetch Site Loads
+            l_stmt = select(SiteLoad.ts, SiteLoad.load_kw, SiteLoad.pv_kw).where(
+                SiteLoad.ts >= start_range, SiteLoad.ts <= end_range
+            )
+            l_res = await session.execute(l_stmt)
+            for ts, load, pv in l_res.all():
+                app_state._load_cache[ts] = (float(load), float(pv))
+
+    except Exception as e:
+        logger.warning("Failed to preload telemetry cache: %s", e)
+
+
+def _get_current_market_and_site(sim_time: datetime) -> tuple[float, float, float]:
+    """Get (price_dam, load_kw, pv_kw) for sim_time with synthetic fallback."""
+    hour_dt = sim_time.replace(minute=0, second=0, microsecond=0)
+    hour = sim_time.hour + sim_time.minute / 60.0
+
+    # 1. DAM Price
+    if hour_dt in app_state._price_cache:
+        price_dam = app_state._price_cache[hour_dt]
+    else:
+        # Realistic synthetic fallback: morning & evening peak
+        if 7.0 <= hour <= 10.0 or 17.0 <= hour <= 22.0:
+            price_dam = 5800.0 + 800.0 * math.sin(math.pi * hour / 12.0) ** 2
+        elif 0.0 <= hour <= 6.0:
+            price_dam = 3100.0 + 300.0 * math.sin(math.pi * hour / 6.0)
+        else:
+            price_dam = 4200.0 + 400.0 * math.cos(math.pi * hour / 12.0)
+
+    # 2. Load & PV
+    if hour_dt in app_state._load_cache:
+        load_kw, pv_kw = app_state._load_cache[hour_dt]
+    else:
+        # Realistic synthetic fallback matching SyntheticDataGenerator
+        if 7.0 <= hour <= 21.5:
+            load_kw = 320.0 + 130.0 * math.sin(math.pi * (hour - 7.0) / 14.5) ** 2
+        else:
+            load_kw = 180.0 + 25.0 * math.sin(math.pi * hour / 7.0)
+
+        if 8.0 <= hour <= 17.5:
+            pv_kw = max(0.0, 184.0 * math.sin(math.pi * (hour - 8.0) / 9.5))
+        else:
+            pv_kw = 0.0
+
+    return price_dam, load_kw, pv_kw
 
 
 async def on_hour_transition(new_hour_start: datetime) -> None:
@@ -227,27 +300,44 @@ async def on_13h_gate_closure(sim_dt: datetime) -> None:
     )
 
 
-async def _build_schedule_for_next_day(sim_dt: datetime) -> None:
-    """Build and activate TOU_SIMPLE schedule for D+1 after 13:00 gate closure."""
+async def _build_schedule_for_date(target_date: date, sim_dt: datetime) -> None:
+    """Build and activate schedule for target_date (SPEC §6.5)."""
     if not app_state.clock or not app_state.market or not app_state.dispatcher:
         return
 
     try:
-        target_date = sim_dt.date() + timedelta(days=1)
-        horizon_start = datetime(
-            target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=UTC
-        )
+        if sim_dt.date() == target_date:
+            horizon_start = sim_dt.replace(minute=0, second=0, microsecond=0)
+        else:
+            horizon_start = datetime(
+                target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=UTC
+            )
+
         horizon_end = datetime(
             target_date.year, target_date.month, target_date.day, 23, 0, 0, tzinfo=UTC
         )
+        if horizon_start >= horizon_end:
+            horizon_end = horizon_start + timedelta(hours=24)
 
         async with async_session_factory() as session:
-            # Get D+1 prices
             tariffs = await app_state.market.get_hourly_tariffs(horizon_start, horizon_end, session)
 
         if not tariffs:
-            logger.warning("No price data for D+1 (%s) — skipping schedule build.", target_date)
-            return
+            # Fallback synthetic tariffs if database is missing this date
+            tariffs = []
+            cur_h = horizon_start
+            m_sim = app_state.market or MarketSimulator()
+            while cur_h <= horizon_end:
+                p_dam, _, _ = _get_current_market_and_site(cur_h)
+                tariffs.append(
+                    {
+                        "ts": cur_h.isoformat(),
+                        "price_dam": p_dam,
+                        "price_buy": calculate_buy_price(p_dam, m_sim.tariffs),
+                        "price_sell": calculate_sell_price(p_dam, m_sim.tariffs),
+                    }
+                )
+                cur_h += timedelta(hours=1)
 
         # Get current BESS state from MQTT cache
         soc_pct = 50.0
@@ -287,7 +377,8 @@ async def _build_schedule_for_next_day(sim_dt: datetime) -> None:
         # Activate in dispatcher
         app_state.dispatcher.set_schedule(schedule)
         logger.info(
-            "D+1 schedule built and activated: %s (%d items, profit=%.2f UAH)",
+            "Schedule for %s built and activated: %s (%d items, profit=%.2f UAH)",
+            target_date,
             schedule.id,
             len(schedule.items),
             schedule.expected_profit_uah or 0,
@@ -306,7 +397,13 @@ async def _build_schedule_for_next_day(sim_dt: datetime) -> None:
         )
 
     except Exception as e:
-        logger.error("Failed to build D+1 schedule: %s", e)
+        logger.error("Failed to build schedule for %s: %s", target_date, e)
+
+
+async def _build_schedule_for_next_day(sim_dt: datetime) -> None:
+    """Build and activate TOU schedule for D+1 after 13:00 gate closure."""
+    target_date = sim_dt.date() + timedelta(days=1)
+    await _build_schedule_for_date(target_date, sim_dt)
 
 
 async def _persist_schedule(schedule: Schedule) -> None:
@@ -409,6 +506,20 @@ def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
     if not app_state.dispatcher or not app_state.clock:
         return
 
+    # Check if active schedule exists for current time; if not, build on the fly
+    active = app_state.dispatcher.active_schedule
+    if active is None or sim_time < active.horizon_start or sim_time >= active.horizon_end:
+        try:
+            asyncio.create_task(_build_schedule_for_date(sim_time.date(), sim_time))
+        except RuntimeError:
+            pass
+
+    # Retrieve current market price and site telemetry
+    price_dam, load_kw, pv_kw = _get_current_market_and_site(sim_time)
+
+    # Update dispatcher with current site load for peak shaving
+    app_state.dispatcher.update_site_load(load_kw)
+
     # Update dispatcher with latest telemetry from MQTT
     if app_state.mqtt and app_state.mqtt.latest_bess_telemetry:
         bess_id = app_state.settings.bess_id
@@ -425,12 +536,13 @@ def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
     # Run dispatcher tick
     decision = app_state.dispatcher.tick(sim_time)
 
-    # Publish setpoint to MQTT
+    # Publish setpoint to MQTT (include both setpoint_kw and power_kw for compatibility)
     if app_state.mqtt and app_state.mqtt.is_connected:
         bess_id = app_state.settings.bess_id
         app_state.mqtt.publish_setpoint(
             bess_id,
             {
+                "setpoint_kw": decision.setpoint_kw,
                 "power_kw": decision.setpoint_kw,
                 "ts_sim": sim_time.isoformat(),
                 "source": "dispatcher",
@@ -445,13 +557,20 @@ def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
         pass
 
     # Broadcast to WebSocket clients
-    _broadcast_ws_tick(sim_time, decision)
+    _broadcast_ws_tick(sim_time, decision, price_dam, load_kw, pv_kw, delta_seconds)
 
     # Broadcast events if new ones appeared
     _broadcast_ws_events()
 
 
-def _broadcast_ws_tick(sim_time: datetime, decision: Any) -> None:
+def _broadcast_ws_tick(
+    sim_time: datetime,
+    decision: Any,
+    price_dam: float,
+    load_kw: float,
+    pv_kw: float,
+    delta_seconds: float,
+) -> None:
     """Build and broadcast WebSocket tick payload (SPEC §10.2)."""
     if ws_manager.connection_count == 0:
         return
@@ -466,24 +585,65 @@ def _broadcast_ws_tick(sim_time: datetime, decision: Any) -> None:
         bess_id = app_state.settings.bess_id
         bess_data = app_state.mqtt.latest_bess_telemetry.get(bess_id, {})
 
+    bess_power = float(bess_data.get("power_kw", decision.setpoint_kw if decision else 0.0))
+
+    # Grid import / export balance
+    net_facility = load_kw - pv_kw + bess_power
+    grid_import = max(0.0, net_facility)
+    grid_export = max(0.0, -net_facility)
+
+    # Market prices & levels
+    tariffs = app_state.market.tariffs if app_state.market else MarketTariffs()
+    price_buy = calculate_buy_price(price_dam, tariffs)
+    price_sell = calculate_sell_price(price_dam, tariffs)
+    if price_dam >= 5500.0:
+        level = "PEAK"
+    elif price_dam <= 3200.0:
+        level = "CHEAP"
+    else:
+        level = "MID"
+
+    # Cumulative financial calculations for simulated day
+    if app_state._current_sim_date != sim_time.date():
+        app_state._current_sim_date = sim_time.date()
+        app_state._today_net_uah = 0.0
+        app_state._today_baseline_uah = 0.0
+
+    dt_hours = max(0.0, delta_seconds) / 3600.0 if delta_seconds > 0 else (1.0 / 60.0)
+    baseline_import = max(0.0, load_kw - pv_kw)
+    cost_baseline = baseline_import * (price_buy / 1000.0) * dt_hours
+    cost_actual = (
+        grid_import * (price_buy / 1000.0) - grid_export * (price_sell / 1000.0)
+    ) * dt_hours
+    deg_cost = 1.25 * abs(bess_power) * dt_hours
+    net_saving = cost_baseline - cost_actual - deg_cost
+
+    app_state._today_baseline_uah += cost_baseline
+    app_state._today_net_uah += net_saving
+
     clock_data = app_state.clock.to_dict() if app_state.clock else {}
 
     payload: dict[str, Any] = {
         "clock": clock_data,
         "bess": bess_data,
         "site": {
-            "load_kw": app_state.dispatcher._site_load_kw if app_state.dispatcher else 0,
-            "pv_kw": 0,
+            "load_kw": round(load_kw, 2),
+            "pv_kw": round(pv_kw, 2),
         },
         "grid": {
-            "import_kw": 0,
-            "export_kw": 0,
+            "import_kw": round(grid_import, 2),
+            "export_kw": round(grid_export, 2),
         },
-        "market": {},
+        "market": {
+            "price_dam": round(price_dam, 2),
+            "price_buy": round(price_buy, 2),
+            "price_sell": round(price_sell, 2),
+            "level": level,
+        },
         "ems": app_state.dispatcher.get_ws_ems_state() if app_state.dispatcher else {},
         "finance": {
-            "today_net_uah": 0,
-            "today_baseline_uah": 0,
+            "today_net_uah": round(app_state._today_net_uah, 2),
+            "today_baseline_uah": round(app_state._today_baseline_uah, 2),
         },
     }
 
@@ -543,8 +703,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
             async with async_session_factory() as session:
                 await ensure_db_initialized_and_seeded(session)
+
+            # Preload telemetry cache & create Day 1 initial schedule
+            if app_state.clock:
+                start_dt = app_state.clock.now()
+                await preload_telemetry_cache(start_dt)
+                await _build_schedule_for_date(start_dt.date(), start_dt)
         except Exception as seed_err:
-            logger.warning("Auto-seed check encountered non-fatal error: %s", seed_err)
+            logger.warning("Auto-seed or schedule initialization error: %s", seed_err)
 
     except Exception as e:
         logger.warning("Database not immediately available on startup (%s).", e)
