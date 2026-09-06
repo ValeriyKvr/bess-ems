@@ -1,7 +1,7 @@
 """Standalone Demo HTTP & WebSocket Server (SPEC §14 Stage 8).
 
 Runs FastAPI + Uvicorn to serve web/dist SPA, API endpoints,
-and live WebSocket telemetry without requiring external PostgreSQL or Mosquitto.
+and live WebSocket telemetry with realistic 24-hour Ukrainian Day-Ahead Market dynamics.
 """
 
 import asyncio
@@ -21,6 +21,49 @@ import uvicorn
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = PROJECT_ROOT / "web" / "dist"
 PORT = 5173
+
+# Ukrainian Day-Ahead Market (РДН) hourly price factors (SPEC §3, generator.py)
+# Reflects: Night valley (00-06), Morning peak (07-11), Solar day dip (12-16), Evening super-peak (17-22)
+DAM_HOURLY_SHAPE = {
+    0: 0.65,
+    1: 0.60,
+    2: 0.58,
+    3: 0.56,
+    4: 0.58,
+    5: 0.65,
+    6: 0.82,
+    7: 1.12,
+    8: 1.25,
+    9: 1.28,
+    10: 1.22,
+    11: 1.10,
+    12: 0.95,
+    13: 0.90,
+    14: 0.88,
+    15: 0.94,
+    16: 1.10,
+    17: 1.35,
+    18: 1.55,
+    19: 1.72,
+    20: 1.75,
+    21: 1.65,
+    22: 1.40,
+    23: 1.02,
+}
+
+
+def get_dam_price(t: datetime) -> float:
+    """Calculate hourly DAM price with smooth minute-to-minute transitions."""
+    base_dam = 4200.0  # Base Ukrainian DAM clearing price in UAH/MWh
+    h1 = t.hour
+    h2 = (h1 + 1) % 24
+    factor1 = DAM_HOURLY_SHAPE.get(h1, 1.0)
+    factor2 = DAM_HOURLY_SHAPE.get(h2, 1.0)
+    alpha = t.minute / 60.0
+    factor = factor1 * (1.0 - alpha) + factor2 * alpha
+    price = base_dam * factor
+    # Regulatory price caps: min 10.0, max 9000.0
+    return round(max(10.0, min(9000.0, price)), 2)
 
 
 class BatterySettings(BaseModel):
@@ -92,23 +135,152 @@ RESTART_REQUIRED_FIELDS: dict[str, list[str]] = {
     "ems": [],
 }
 
-# In-memory mutable settings
 CURRENT_SETTINGS: dict[str, dict[str, Any]] = {
     k: v().model_dump() for k, v in SECTION_MODELS.items()
 }
 
-# Connected WebSockets for telemetry
 active_connections: list[WebSocket] = []
 sim_state = {
     "is_running": True,
     "speed": 60,
     "step_count": 0,
-    "start_sim_time": datetime(2026, 3, 2, 8, 0, 0, tzinfo=UTC),
+    "start_sim_time": datetime(2026, 3, 2, 8, 15, 0, tzinfo=UTC),
 }
 
 
+def make_tick(t_sim: datetime) -> dict[str, Any]:
+    """Generate realistic physical and market telemetry for a specific point in time."""
+    hour = t_sim.hour + t_sim.minute / 60.0
+    dam_price = get_dam_price(t_sim)
+
+    # 1. Industrial site load (active power in kW)
+    if 7.0 <= hour <= 21.5:
+        # Working day factory load with peaks
+        load_kw = 320.0 + 130.0 * math.sin(math.pi * (hour - 7.0) / 14.5) ** 2
+    else:
+        # Night baseline
+        load_kw = 180.0 + 25.0 * math.sin(math.pi * hour / 7.0)
+
+    # 2. On-site Solar PV (200 kW peak installed)
+    if 8.0 <= hour <= 17.5:
+        pv_kw = max(0.0, 185.0 * math.sin(math.pi * (hour - 8.0) / 9.5))
+    else:
+        pv_kw = 0.0
+
+    # 3. BESS Dispatch Strategy (Arbitrage / Peak Shaving)
+    # - Night (01:00 - 06:00): Cheap DAM (2400-2800 UAH) -> CHARGE at +250 kW
+    # - Evening Peak (17:30 - 22:30): Expensive DAM (5800-7200 UAH) -> DISCHARGE at -320 kW
+    # - Day Solar surplus (12:00 - 15:00): CHARGE at +80 kW
+    # - Other hours: Idle (0 kW) or small peak shave
+    if 1.0 <= hour < 6.5:
+        bess_power = 250.0  # charging (+kW)
+        bess_state = "CHARGING"
+        reason = "charge_night_valley"
+    elif 17.5 <= hour < 22.5:
+        bess_power = -320.0  # discharging (-kW)
+        bess_state = "DISCHARGING"
+        reason = "discharge_evening_peak"
+    elif 12.0 <= hour < 15.0 and pv_kw > 120.0:
+        bess_power = 80.0
+        bess_state = "CHARGING"
+        reason = "solar_self_consumption"
+    elif load_kw > 420.0:
+        bess_power = -70.0
+        bess_state = "DISCHARGING"
+        reason = "peak_shaving"
+    else:
+        bess_power = 0.0
+        bess_state = "STANDBY"
+        reason = "idle"
+
+    # 4. Realistic Battery SoC dynamics across 24h
+    if 1.0 <= hour < 6.5:
+        # Charging from 20% to 88%
+        soc_pct = 20.0 + ((hour - 1.0) / 5.5) * 68.0
+    elif 6.5 <= hour < 12.0:
+        soc_pct = 88.0 - (hour - 6.5) * 0.4
+    elif 12.0 <= hour < 15.0:
+        soc_pct = 85.8 + (hour - 12.0) * 1.2
+    elif 15.0 <= hour < 17.5:
+        soc_pct = 89.4 - (hour - 15.0) * 0.6
+    elif 17.5 <= hour < 22.5:
+        # Discharging down from 88% to 18%
+        soc_pct = 88.0 - ((hour - 17.5) / 5.0) * 70.0
+    else:
+        soc_pct = 18.0 + (hour * 0.5 if hour < 1.0 else (hour - 22.5) * 0.4)
+
+    soc_pct = max(10.0, min(90.0, soc_pct))
+
+    # 5. External Grid balance (sign: import > 0, export < 0)
+    net_facility = load_kw - pv_kw + bess_power
+    grid_import = max(0.0, net_facility)
+    grid_export = max(0.0, -net_facility)
+
+    # 6. Market level indicator
+    if dam_price >= 5500.0:
+        level = "PEAK"
+    elif dam_price <= 3200.0:
+        level = "CHEAP"
+    else:
+        level = "MID"
+
+    regulated_tariffs = 1928.57  # transmission + distribution + margin
+    price_buy = dam_price + regulated_tariffs
+    price_sell = dam_price * 0.90
+
+    # 7. Financial savings computation
+    today_net_savings = 1200.0 + (hour / 24.0) * 2300.0
+    today_baseline_cost = 3100.0 + (hour / 24.0) * 6800.0
+
+    return {
+        "type": "tick",
+        "clock": {
+            "ts_sim": t_sim.isoformat(),
+            "speed": sim_state["speed"],
+            "is_running": sim_state["is_running"],
+        },
+        "bess": {
+            "soc_pct": round(soc_pct, 2),
+            "power_kw": round(bess_power, 1),
+            "voltage_v": round(795.0 + (soc_pct / 100.0) * 25.0, 1),
+            "temp_c": round(23.5 + abs(bess_power) * 0.012, 1),
+            "state": bess_state,
+        },
+        "site": {
+            "load_kw": round(load_kw, 1),
+            "pv_kw": round(pv_kw, 1),
+        },
+        "grid": {
+            "import_kw": round(grid_import, 1),
+            "export_kw": round(grid_export, 1),
+            "power_kw": round(grid_import - grid_export, 1),
+            "voltage_v": 398.5,
+            "frequency_hz": 50.01,
+        },
+        "market": {
+            "price_dam": round(dam_price, 2),
+            "price_dam_uah_mwh": round(dam_price, 2),
+            "price_buy": round(price_buy, 2),
+            "price_buy_uah_mwh": round(price_buy, 2),
+            "price_sell": round(price_sell, 2),
+            "price_sell_uah_mwh": round(price_sell, 2),
+            "level": level,
+        },
+        "ems": {
+            "setpoint_kw": round(bess_power, 1),
+            "strategy": "ARBITRAGE",
+            "state": "DISPATCHING",
+            "reason": reason,
+        },
+        "finance": {
+            "today_net_uah": round(today_net_savings, 2),
+            "today_baseline_uah": round(today_baseline_cost, 2),
+        },
+    }
+
+
 async def telemetry_broadcaster():
-    """Background task streaming realistic live telemetry ticks every second."""
+    """Background loop sending live telemetry ticks every second."""
     while True:
         await asyncio.sleep(1.0)
         if not active_connections:
@@ -120,76 +292,13 @@ async def telemetry_broadcaster():
         t_sim = sim_state["start_sim_time"] + timedelta(
             seconds=sim_state["step_count"] * sim_state["speed"]
         )
-        hour = t_sim.hour + t_sim.minute / 60.0
 
-        # Dynamic simulation physics:
-        # Load profile with morning & evening peaks
-        load_kw = 320.0 + 150.0 * math.sin(math.pi * (hour - 6) / 12) ** 2 if 6 <= hour <= 22 else 180.0
-        # PV generation during daytime (08:00 - 18:00)
-        pv_kw = max(0.0, 180.0 * math.sin(math.pi * (hour - 7) / 11)) if 7 <= hour <= 18 else 0.0
+        tick = make_tick(t_sim)
 
-        # Battery cycle: Charge at night / early morning, discharge during evening peak
-        if 1 <= hour <= 6:
-            bess_power = 280.0  # charging
-            bess_state = "CHARGING"
-        elif 17 <= hour <= 22:
-            bess_power = -320.0  # discharging
-            bess_state = "DISCHARGING"
-        else:
-            bess_power = -50.0 if load_kw > 350 else 60.0
-            bess_state = "DISCHARGING" if bess_power < 0 else "CHARGING"
-
-        # SoC dynamic calculation oscillating between 25% and 85%
-        soc_pct = 55.0 + 30.0 * math.sin(math.pi * (hour - 3) / 12)
-        soc_pct = max(10.0, min(90.0, soc_pct))
-
-        # Net grid power: site_load - pv + bess_power
-        grid_power = load_kw - pv_kw + bess_power
-        dam_price = 3200.0 + 3400.0 * (math.sin(math.pi * (hour - 8) / 14) ** 2)
-
-        tick_payload = {
-            "type": "tick",
-            "clock": {
-                "ts_sim": t_sim.isoformat(),
-                "speed": sim_state["speed"],
-                "is_running": sim_state["is_running"],
-            },
-            "bess": {
-                "soc_pct": round(soc_pct, 2),
-                "power_kw": round(bess_power, 1),
-                "voltage_v": 804.2,
-                "temp_c": round(24.5 + abs(bess_power) * 0.015, 1),
-                "state": bess_state,
-            },
-            "site": {
-                "load_kw": round(load_kw, 1),
-                "pv_kw": round(pv_kw, 1),
-            },
-            "grid": {
-                "power_kw": round(grid_power, 1),
-                "voltage_v": 398.5,
-                "frequency_hz": 50.02,
-            },
-            "market": {
-                "price_dam_uah_mwh": round(dam_price, 2),
-                "price_buy_uah_mwh": round(dam_price + 1928.57, 2),
-                "price_sell_uah_mwh": round(dam_price * 0.90, 2),
-            },
-            "ems": {
-                "setpoint_kw": round(bess_power, 1),
-                "strategy": "ARBITRAGE",
-            },
-            "finance": {
-                "today_net_uah": round(1450.0 + (sim_state["step_count"] * 1.8), 2),
-                "today_baseline_uah": round(6800.0 + (sim_state["step_count"] * 2.2), 2),
-            },
-        }
-
-        # Broadcast to all connected WebSockets
         dead_conns = []
         for ws in active_connections:
             try:
-                await ws.send_json(tick_payload)
+                await ws.send_json(tick)
             except Exception:
                 dead_conns.append(ws)
         for dead in dead_conns:
@@ -215,14 +324,26 @@ app.add_middleware(
 )
 
 
-# --- WEBSOCKET TELEMETRY ---
+# --- WEBSOCKET TELEMETRY WITH PRELOADED 24-HOUR HISTORY ---
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry(websocket: WebSocket):
     await websocket.accept()
     active_connections.append(websocket)
     try:
+        # Preload the last 24 hours of history so the user immediately sees the entire curve
+        current_t = sim_state["start_sim_time"] + timedelta(
+            seconds=sim_state["step_count"] * sim_state["speed"]
+        )
+        # Send 48 points across past 24 hours (every 30 mins)
+        for i in range(48, 0, -1):
+            hist_t = current_t - timedelta(minutes=i * 30)
+            hist_tick = make_tick(hist_t)
+            await websocket.send_json(hist_tick)
+
+        # Send current instant tick
+        await websocket.send_json(make_tick(current_t))
+
         while True:
-            # Keep receiving client pings / messages
             await websocket.receive_text()
     except WebSocketDisconnect:
         if websocket in active_connections:
@@ -297,7 +418,7 @@ async def get_schedule_detail(schedule_id: str):
     now = datetime(2026, 3, 2, 0, 0, 0, tzinfo=UTC)
     items = []
     for h in range(24):
-        p = 250.0 if 1 <= h <= 6 else (-300.0 if 18 <= h <= 22 else 0.0)
+        p = 250.0 if 1 <= h <= 6 else (-320.0 if 18 <= h <= 22 else 0.0)
         reason = "charge_low_dam" if p > 0 else ("discharge_peak_dam" if p < 0 else "idle")
         items.append({
             "ts": (now + timedelta(hours=h)).isoformat(),
@@ -384,18 +505,16 @@ async def get_ml_backtest():
 
 @app.get("/api/forecasts")
 async def get_forecasts():
-    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    now = datetime(2026, 3, 2, 0, 0, 0, tzinfo=UTC)
     items = []
-    prices = [3100, 2950, 2900, 3050, 3400, 4600, 5500, 5700, 5400, 4900, 4600, 4500,
-              4600, 4900, 5300, 6100, 7000, 7300, 7000, 6300, 5200, 4300, 3700, 3300]
-    for i in range(24):
-        t = now + timedelta(hours=i)
-        p = prices[i]
+    for h in range(24):
+        t = now + timedelta(hours=h)
+        p = get_dam_price(t)
         items.append({
             "ts": t.isoformat(),
             "value": p,
-            "p10": p * 0.92,
-            "p90": p * 1.08,
+            "p10": round(p * 0.92, 2),
+            "p90": round(p * 1.08, 2),
         })
     return {"target": "price", "forecasts": items}
 
@@ -463,12 +582,16 @@ async def get_compare_strategies():
 @app.get("/api/data/heatmap")
 async def get_data_heatmap():
     matrix = []
+    base_date = datetime(2026, 3, 2, 0, 0, 0, tzinfo=UTC)
     for d in range(7):
+        day_date = base_date + timedelta(days=d)
+        is_weekend = d in (5, 6)
         for h in range(24):
-            base = 3200 + 3000 * ((1 - ((h - 18) / 8) ** 2) if 10 <= h <= 22 else 0.1)
-            if d in (5, 6):
-                base *= 0.85
-            matrix.append([h, d, round(base, 1)])
+            t = day_date.replace(hour=h)
+            price = get_dam_price(t)
+            if is_weekend:
+                price *= 0.85
+            matrix.append([h, d, round(price, 1)])
     return {"type": "price", "matrix": matrix}
 
 
@@ -483,10 +606,10 @@ async def get_dispatch_logs(page: int = 1, limit: int = 15):
         items.append({
             "id": 100 - i,
             "ts": t.isoformat(),
-            "setpoint_kw": -250.0 if i % 2 == 0 else 300.0,
-            "actual_kw": -248.5 if i % 2 == 0 else 298.0,
+            "setpoint_kw": -320.0 if i % 2 == 0 else 250.0,
+            "actual_kw": -318.5 if i % 2 == 0 else 248.0,
             "reason": reasons[i % len(reasons)],
-            "schedule_id": f"sch-20260301-{10 - i // 2}",
+            "schedule_id": f"sch-20260302-{10 - i // 2}",
             "override": i == 2,
         })
     return {
@@ -532,7 +655,7 @@ def run_demo():
     print(f"\n=======================================================")
     print(f"  BESS EMS Live Demo Server running on:")
     print(f"  -> http://localhost:{PORT}")
-    print(f"  Includes Live Telemetry WebSocket + Interactive UI")
+    print(f"  Includes Live Telemetry WebSocket + Realistic 24h Ukrainian DAM")
     print(f"=======================================================\n")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
