@@ -410,6 +410,18 @@ async def _build_schedule_for_date(target_date: date, sim_dt: datetime) -> None:
         bat_cfg = await get_battery_settings()
         strat_cfg = await get_strategy_settings()
 
+        # Collect site load and PV forecasts for the horizon
+        load_series: list[float] = []
+        pv_series: list[float] = []
+        cur_h = horizon_start
+        while cur_h <= horizon_end:
+            _, l_kw, p_kw = _get_current_market_and_site(cur_h)
+            load_series.append(l_kw)
+            pv_series.append(p_kw)
+            cur_h += timedelta(hours=1)
+
+        c_deg = bat_cfg.degradation_cost_uah_per_kwh() * strat_cfg.degradation_cost_weight
+
         context = ScheduleContext(
             current_time=sim_dt,
             horizon_start=horizon_start,
@@ -423,6 +435,11 @@ async def _build_schedule_for_date(target_date: date, sim_dt: datetime) -> None:
             reserve_soc_pct=strat_cfg.reserve_soc_pct,
             peak_limit_kw=strat_cfg.peak_limit_kw,
             prices=tariffs,
+            load_series=load_series,
+            pv_series=pv_series,
+            c_deg_uah_kwh=c_deg,
+            eff_charge=bat_cfg.eff_charge,
+            eff_discharge=bat_cfg.eff_discharge,
         )
 
         strategy = get_strategy(
@@ -528,6 +545,18 @@ async def on_rolling_reopt_trigger(sim_time: datetime, current_soc: float) -> No
         bat_cfg = await get_battery_settings()
         strat_cfg = await get_strategy_settings()
 
+        # Collect site load and PV forecasts for the horizon
+        load_series: list[float] = []
+        pv_series: list[float] = []
+        cur_h = horizon_start
+        while cur_h <= horizon_end:
+            _, l_kw, p_kw = _get_current_market_and_site(cur_h)
+            load_series.append(l_kw)
+            pv_series.append(p_kw)
+            cur_h += timedelta(hours=1)
+
+        c_deg = bat_cfg.degradation_cost_uah_per_kwh() * strat_cfg.degradation_cost_weight
+
         context = ScheduleContext(
             current_time=sim_time,
             horizon_start=horizon_start,
@@ -541,6 +570,11 @@ async def on_rolling_reopt_trigger(sim_time: datetime, current_soc: float) -> No
             reserve_soc_pct=strat_cfg.reserve_soc_pct,
             peak_limit_kw=strat_cfg.peak_limit_kw,
             prices=tariffs,
+            load_series=load_series,
+            pv_series=pv_series,
+            c_deg_uah_kwh=c_deg,
+            eff_charge=bat_cfg.eff_charge,
+            eff_discharge=bat_cfg.eff_discharge,
         )
         strategy = get_strategy(app_state._strategy_name)
         new_schedule = strategy.build_schedule(context)
@@ -865,7 +899,9 @@ async def _load_runtime_settings() -> dict[str, Any]:
         app_state.market.tariffs = tariffs
 
     app_state._strategy_name = strategy.active_strategy
-    app_state.deg_cost_uah_per_kwh = battery.degradation_cost_uah_per_kwh()
+    app_state.deg_cost_uah_per_kwh = (
+        battery.degradation_cost_uah_per_kwh() * strategy.degradation_cost_weight
+    )
 
     if app_state.dispatcher is not None:
         app_state.dispatcher.config.soc_min_pct = battery.soc_min_pct

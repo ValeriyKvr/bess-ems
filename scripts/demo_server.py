@@ -10,7 +10,7 @@ import math
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -76,12 +76,22 @@ class BatterySettings(BaseModel):
     soc_hard_max_pct: float = Field(default=97.0, ge=80.0, le=100.0)
     eff_charge: float = Field(default=0.95, gt=0.5, le=1.0)
     eff_discharge: float = Field(default=0.95, gt=0.5, le=1.0)
+    soc_derate_charge_start_pct: float = Field(default=85.0, ge=20.0, le=100.0)
+    soc_derate_discharge_start_pct: float = Field(default=15.0, ge=0.0, le=80.0)
     self_discharge_pct_day: float = Field(default=0.1, ge=0.0, le=5.0)
     aux_load_kw: float = Field(default=3.0, ge=0.0, le=50.0)
+    aux_from_ac: bool = Field(default=True)
     ramp_rate_kw_s: float = Field(default=50.0, ge=1.0, le=1000.0)
     temp_ambient_c: float = Field(default=25.0, ge=-30.0, le=60.0)
     temp_max_c: float = Field(default=45.0, ge=30.0, le=80.0)
+    thermal_loss_frac_rated: float = Field(default=0.025, ge=0.001, le=0.2)
+    cooling_design_delta_t_c: float = Field(default=10.0, ge=1.0, le=40.0)
+    thermal_mass_kj_per_kwh: float = Field(default=5.0, ge=0.5, le=50.0)
+    v_nominal_v: float = Field(default=780.0, ge=48.0, le=2000.0)
     cycle_life: float = Field(default=6000.0, ge=500.0, le=30000.0)
+    calendar_fade_pct_per_year: float = Field(default=1.5, ge=0.0, le=10.0)
+    deg_temp_ref_c: float = Field(default=25.0, ge=0.0, le=45.0)
+    deg_temp_doubling_k: float = Field(default=10.0, ge=2.0, le=30.0)
     capex_uah: float = Field(default=15000000.0, ge=0.0)
     initial_soc_pct: float = Field(default=50.0, ge=0.0, le=100.0)
 
@@ -97,7 +107,13 @@ class MarketTariffs(BaseModel):
 
 
 class StrategySettings(BaseModel):
-    active_strategy: str = Field(default="ARBITRAGE")
+    active_strategy: Literal[
+        "ARBITRAGE",
+        "PEAK_SHAVING",
+        "SELF_CONSUMPTION",
+        "BACKUP_RESERVE",
+        "TOU_SIMPLE",
+    ] = Field(default="ARBITRAGE")
     w_arbitrage: float = Field(default=1.0, ge=0.0, le=10.0)
     w_peak: float = Field(default=1.0, ge=0.0, le=10.0)
     w_reserve: float = Field(default=1.0, ge=0.0, le=10.0)

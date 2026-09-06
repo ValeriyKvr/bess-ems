@@ -97,6 +97,9 @@ class ScheduleContext:
     peak_limit_kw: float | None = None
     reserve_soc_pct: float = 20.0
     export_allowed: bool = True
+    c_deg_uah_kwh: float | None = None
+    eff_charge: float = 0.95
+    eff_discharge: float = 0.95
 
 
 class Strategy(ABC):
@@ -371,6 +374,9 @@ class MilpStrategy(Strategy):
             w_reserve=self.w_reserve,
             w_self=self.w_self,
             strategy_name=self.strategy_name,
+            c_deg_uah_kwh=context.c_deg_uah_kwh if context.c_deg_uah_kwh is not None else 1.25,
+            eta_ch=context.eff_charge,
+            eta_dis=context.eff_discharge,
         )
 
         return solve(problem)

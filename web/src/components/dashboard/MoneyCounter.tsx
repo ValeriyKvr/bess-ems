@@ -60,7 +60,7 @@ export function MoneyCounter() {
           className={`p-3 rounded-xl border ${
             isPositive
               ? 'bg-emerald-950/60 border-emerald-500/30 text-emerald-400'
-              : 'bg-rose-950/60 border-rose-500/30 text-rose-400'
+              : 'bg-amber-950/60 border-amber-500/30 text-amber-400'
           }`}
         >
           <Coins className="w-6 h-6" />
@@ -69,17 +69,24 @@ export function MoneyCounter() {
           <div className="text-xs font-semibold text-slate-400 flex items-center gap-1.5">
             <span>Економічний ефект за добу</span>
             <span
-              className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                isPositive ? 'bg-emerald-950 text-emerald-300' : 'bg-rose-950 text-rose-300'
+              title={
+                isPositive
+                  ? 'Чиста економія підприємства з урахуванням зносу BESS'
+                  : 'Нічний заряд формує тимчасові витрати на закупівлю енергії — чиста вигода фіксується після вечірнього пікового розряду (18:00–22:00)'
+              }
+              className={`px-1.5 py-0.5 rounded text-[10px] font-bold cursor-help ${
+                isPositive
+                  ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30'
+                  : 'bg-amber-950 text-amber-300 border border-amber-500/30'
               }`}
             >
-              {isPositive ? '+ВИГОДА' : '-ЗБИТОК'}
+              {isPositive ? '+ВИГОДА' : 'ЗАРЯД / НАКОПИЧЕННЯ'}
             </span>
           </div>
           <div className="flex items-baseline gap-1.5 mt-0.5">
             <span
               className={`text-2xl lg:text-3xl font-black font-mono tracking-tight transition-colors ${
-                isPositive ? 'text-emerald-400' : 'text-rose-400'
+                isPositive ? 'text-emerald-400' : 'text-amber-400'
               }`}
             >
               {isPositive ? `+${displayedNet.toLocaleString('uk-UA')}` : displayedNet.toLocaleString('uk-UA')}

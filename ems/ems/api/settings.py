@@ -292,6 +292,10 @@ async def apply_settings_to_runtime(section: str, validated_obj: BaseModel) -> l
         if app_state.dispatcher is not None:
             app_state.dispatcher.config.peak_limit_kw = validated_obj.peak_limit_kw
             applied.append("dispatcher_peak_limit")
+        app_state._deg_cost_weight = validated_obj.degradation_cost_weight
+        raw_deg = getattr(app_state, "_raw_deg_cost_per_kwh", app_state.deg_cost_uah_per_kwh)
+        app_state.deg_cost_uah_per_kwh = raw_deg * app_state._deg_cost_weight
+        applied.append("degradation_cost")
 
     if section == "ems" and isinstance(validated_obj, EmsCoreSettings):
         if app_state.dispatcher is not None:
@@ -303,7 +307,9 @@ async def apply_settings_to_runtime(section: str, validated_obj: BaseModel) -> l
             app_state.dispatcher.config.soc_min_pct = validated_obj.soc_min_pct
             app_state.dispatcher.config.soc_max_pct = validated_obj.soc_max_pct
             applied.append("dispatcher_soc_limits")
-        app_state.deg_cost_uah_per_kwh = validated_obj.degradation_cost_uah_per_kwh()
+        app_state._raw_deg_cost_per_kwh = validated_obj.degradation_cost_uah_per_kwh()
+        deg_weight = getattr(app_state, "_deg_cost_weight", 1.0)
+        app_state.deg_cost_uah_per_kwh = app_state._raw_deg_cost_per_kwh * deg_weight
         applied.append("degradation_cost")
         if app_state.mqtt is not None:
             app_state.mqtt.publish_config(
