@@ -1,6 +1,16 @@
-"""Thermal dynamics model for BESS battery cells (SPEC §5.2 Step 4)."""
+"""Thermal dynamics model for BESS battery cells (SPEC §5.2 Step 4).
+
+Realistic parameters for a 1 MWh / 500 kW LFP containerized BESS:
+- Pack mass ~10 tonnes, effective thermal mass ~5000 kJ/K (c_thermal).
+- Internal resistance scaled to pack level: ~0.00005 Ω·kW⁻² equivalent.
+- Forced-air / liquid cooling coefficient: ~1.2 kW/K.
+- At full power (500 kW) equilibrium temperature: ~35°C (well below 45°C trip).
+"""
 
 from dataclasses import dataclass
+
+# Maximum internal sub-step to ensure Euler stability (seconds)
+_MAX_SUBSTEP_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -15,14 +25,17 @@ def step_thermal(
     power_kw: float,
     dt_seconds: float,
     temp_ambient_c: float = 25.0,
-    r_internal: float = 0.00008,
-    k_cooling: float = 0.8,
-    c_thermal: float = 300.0,
+    r_internal: float = 0.00005,
+    k_cooling: float = 1.2,
+    c_thermal: float = 5000.0,
     forced_temp_c: float | None = None,
 ) -> ThermalState:
     """Compute temperature after time step dt using formula:
 
     dT/dt = (P²·R_internal − k·(T − T_ambient)) / C_thermal
+
+    Uses sub-stepping (max 30 s per Euler step) to prevent numerical
+    instability at high simulation speeds (600×, 3600×).
     """
     if forced_temp_c is not None:
         return ThermalState(temp_c=forced_temp_c)
@@ -32,14 +45,17 @@ def step_thermal(
 
     current_t = state.temp_c
     heat_gen_kw = (power_kw**2) * r_internal
-    heat_dissipated_kw = k_cooling * (current_t - temp_ambient_c)
-    net_heat_flow_kw = heat_gen_kw - heat_dissipated_kw
 
-    # dT = (Q_net / C_thermal) * dt
-    dt_temp = (net_heat_flow_kw / c_thermal) * dt_seconds
-    new_temp = current_t + dt_temp
+    # Sub-step for numerical stability
+    remaining = dt_seconds
+    while remaining > 0.0:
+        sub_dt = min(remaining, _MAX_SUBSTEP_S)
+        heat_dissipated_kw = k_cooling * (current_t - temp_ambient_c)
+        net_heat_flow_kw = heat_gen_kw - heat_dissipated_kw
+        current_t += (net_heat_flow_kw / c_thermal) * sub_dt
+        remaining -= sub_dt
 
-    return ThermalState(temp_c=round(new_temp, 4))
+    return ThermalState(temp_c=round(current_t, 4))
 
 
 class ThermalModel:
@@ -48,9 +64,9 @@ class ThermalModel:
     def __init__(
         self,
         temp_ambient_c: float = 25.0,
-        r_internal: float = 0.00008,
-        k_cooling: float = 0.8,
-        c_thermal: float = 300.0,
+        r_internal: float = 0.00005,
+        k_cooling: float = 1.2,
+        c_thermal: float = 5000.0,
     ) -> None:
         self.temp_ambient_c = temp_ambient_c
         self.r_internal = r_internal
