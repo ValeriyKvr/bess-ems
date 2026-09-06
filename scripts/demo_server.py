@@ -4,25 +4,98 @@ Serves web/dist production bundle and provides populated API endpoints
 for Settings, ML, Data, Reports, and Logs without requiring an external database.
 """
 
-# ruff: noqa: E402
 import http.server
 import json
 import socketserver
-import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
-# Ensure ems is discoverable for Pydantic schemas
+from pydantic import BaseModel, Field
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-EMS_DIR = PROJECT_ROOT / "ems"
-if str(EMS_DIR) not in sys.path:
-    sys.path.insert(0, str(EMS_DIR))
-
-from ems.api.settings import SECTION_MODELS
-
 PORT = 5173
 DIST_DIR = str(PROJECT_ROOT / "web" / "dist")
+
+
+class BatterySettings(BaseModel):
+    """BESS hardware and operating settings (SPEC §5.1)."""
+
+    capacity_kwh: float = Field(default=1000.0, ge=10.0, le=100000.0)
+    power_max_kw: float = Field(default=500.0, ge=5.0, le=50000.0)
+    soc_min_pct: float = Field(default=10.0, ge=0.0, le=50.0)
+    soc_max_pct: float = Field(default=90.0, ge=50.0, le=100.0)
+    soc_hard_min_pct: float = Field(default=5.0, ge=0.0, le=20.0)
+    soc_hard_max_pct: float = Field(default=97.0, ge=80.0, le=100.0)
+    eff_charge: float = Field(default=0.95, gt=0.5, le=1.0)
+    eff_discharge: float = Field(default=0.95, gt=0.5, le=1.0)
+    self_discharge_pct_day: float = Field(default=0.1, ge=0.0, le=5.0)
+    aux_load_kw: float = Field(default=3.0, ge=0.0, le=50.0)
+    ramp_rate_kw_s: float = Field(default=50.0, ge=1.0, le=1000.0)
+    temp_ambient_c: float = Field(default=25.0, ge=-30.0, le=60.0)
+    temp_max_c: float = Field(default=45.0, ge=30.0, le=80.0)
+    cycle_life: float = Field(default=6000.0, ge=500.0, le=30000.0)
+    capex_uah: float = Field(default=15000000.0, ge=0.0)
+    initial_soc_pct: float = Field(default=50.0, ge=0.0, le=100.0)
+
+
+class MarketTariffs(BaseModel):
+    """Tariffs structure for Ukrainian commercial electricity consumers (SPEC §3.1)."""
+
+    transmission_tariff_uah_mwh: float = Field(default=528.57)
+    distribution_tariff_uah_mwh: float = Field(default=1250.00)
+    supplier_margin_uah_mwh: float = Field(default=150.00)
+    export_price_coeff: float = Field(default=0.90)
+    export_allowed: bool = Field(default=True)
+    price_cap_min: float = Field(default=10.0)
+    price_cap_max: float = Field(default=9000.0)
+
+
+class StrategySettings(BaseModel):
+    """Energy dispatch strategy parameters (SPEC §6.7, §9)."""
+
+    active_strategy: str = Field(default="ARBITRAGE")
+    w_arbitrage: float = Field(default=1.0, ge=0.0, le=10.0)
+    w_peak: float = Field(default=1.0, ge=0.0, le=10.0)
+    w_reserve: float = Field(default=1.0, ge=0.0, le=10.0)
+    reserve_soc_pct: float = Field(default=20.0, ge=0.0, le=100.0)
+    peak_limit_kw: float = Field(default=500.0, ge=10.0)
+    degradation_cost_weight: float = Field(default=1.0, ge=0.0, le=2.0)
+
+
+class SimulationSettings(BaseModel):
+    """Simulation run parameters."""
+
+    default_scenario: str = Field(default="default")
+    default_speed: int = Field(default=60)
+    seed: int = Field(default=42)
+    pv_enabled: bool = Field(default=True)
+    pv_peak_kw: float = Field(default=200.0, ge=0.0)
+
+
+class EmsCoreSettings(BaseModel):
+    """EMS Core algorithm parameters."""
+
+    soc_tolerance_pct: float = Field(default=3.0, ge=0.5, le=20.0)
+    optimization_horizon_h: int = Field(default=24, ge=12, le=72)
+    optimization_step_min: int = Field(default=60)
+
+
+SECTION_MODELS: dict[str, type[BaseModel]] = {
+    "battery": BatterySettings,
+    "market": MarketTariffs,
+    "strategy": StrategySettings,
+    "simulation": SimulationSettings,
+    "ems": EmsCoreSettings,
+}
+
+RESTART_REQUIRED_FIELDS: dict[str, list[str]] = {
+    "battery": ["capacity_kwh", "power_max_kw", "initial_soc_pct"],
+    "simulation": ["seed", "default_scenario"],
+    "strategy": [],
+    "market": [],
+    "ems": [],
+}
 
 
 class DemoServerHandler(http.server.SimpleHTTPRequestHandler):
@@ -46,6 +119,7 @@ class DemoServerHandler(http.server.SimpleHTTPRequestHandler):
                             {
                                 "section": section,
                                 "schema": model_cls.model_json_schema(),
+                                "requires_restart": RESTART_REQUIRED_FIELDS.get(section, []),
                             }
                         )
                         return
