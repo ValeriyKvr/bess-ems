@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sqlalchemy import desc, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from ems.core.config import EmsSettings
 from ems.db.models import DamPrice, DispatchLog, Forecast, MlModel
@@ -95,18 +96,30 @@ async def generate_day_ahead_forecast(
         p10_val = float(p10_arr[h])
         p90_val = float(p90_arr[h])
 
-        f_row = Forecast(
-            ts=step_ts,
-            target="price",
-            model_name=model.name,
-            model_version=getattr(model, "version", "v1.0.0"),
-            created_at_sim=sim_dt,
-            horizon_h=h + 1,
-            value=val,
-            p10=p10_val,
-            p90=p90_val,
+        stmt = (
+            pg_insert(Forecast)
+            .values(
+                ts=step_ts,
+                target="price",
+                model_name=model.name,
+                model_version=getattr(model, "version", "v1.0.0"),
+                created_at_sim=sim_dt,
+                horizon_h=h + 1,
+                value=val,
+                p10=p10_val,
+                p90=p90_val,
+            )
+            .on_conflict_do_update(
+                index_elements=["ts", "target", "model_name", "model_version", "created_at_sim"],
+                set_={
+                    "value": val,
+                    "p10": p10_val,
+                    "p90": p90_val,
+                    "horizon_h": h + 1,
+                },
+            )
         )
-        session.add(f_row)
+        await session.execute(stmt)
 
         results.append(
             {
