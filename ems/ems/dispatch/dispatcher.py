@@ -47,7 +47,9 @@ class DispatcherConfig:
     soc_min_pct: float = 10.0
     soc_max_pct: float = 90.0
     soc_tolerance_pct: float = 3.0
-    peak_limit_kw: float = 800.0
+    # Kept in sync with StrategySettings.peak_limit_kw so the reactive rule and the
+    # scheduler use the same limit even before settings are loaded from the database.
+    peak_limit_kw: float = 500.0
     telemetry_timeout_sim_minutes: float = 3.0
     safe_mode_setpoint_kw: float = 0.0
 

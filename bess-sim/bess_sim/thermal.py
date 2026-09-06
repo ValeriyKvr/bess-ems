@@ -29,10 +29,15 @@ def step_thermal(
     k_cooling: float = 1.2,
     c_thermal: float = 5000.0,
     forced_temp_c: float | None = None,
+    heat_kw: float | None = None,
 ) -> ThermalState:
     """Compute temperature after time step dt using formula:
 
     dT/dt = (P²·R_internal − k·(T − T_ambient)) / C_thermal
+
+    When ``heat_kw`` is supplied it replaces the P²·R_internal term — the caller
+    has already computed the true ohmic loss I²·R from the terminal current,
+    which is the physically correct heat source.
 
     Uses sub-stepping (max 30 s per Euler step) to prevent numerical
     instability at high simulation speeds (600×, 3600×).
@@ -44,7 +49,7 @@ def step_thermal(
         return state
 
     current_t = state.temp_c
-    heat_gen_kw = (power_kw**2) * r_internal
+    heat_gen_kw = heat_kw if heat_kw is not None else (power_kw**2) * r_internal
 
     # Sub-step for numerical stability
     remaining = dt_seconds
@@ -79,7 +84,7 @@ class ThermalModel:
     def temp_c(self) -> float:
         return self._state.temp_c
 
-    def step(self, power_kw: float, dt_seconds: float) -> float:
+    def step(self, power_kw: float, dt_seconds: float, heat_kw: float | None = None) -> float:
         """Advance thermal model by dt_seconds."""
         self._state = step_thermal(
             state=self._state,
@@ -90,6 +95,7 @@ class ThermalModel:
             k_cooling=self.k_cooling,
             c_thermal=self.c_thermal,
             forced_temp_c=self.forced_temp_c,
+            heat_kw=heat_kw,
         )
         return self._state.temp_c
 

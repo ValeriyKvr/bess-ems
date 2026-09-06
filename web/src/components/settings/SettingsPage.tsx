@@ -18,6 +18,7 @@ import {
   fetchSettingsSection,
   updateSettingsSection,
   injectFault,
+  fetchHealth,
 } from '../../api/client';
 import { SettingsSchemaResponse } from '../../types';
 import ukTranslations from '../../i18n/uk.json';
@@ -34,6 +35,7 @@ export const SettingsPage: React.FC = () => {
   const [isSaving, setIsSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [faultStatus, setFaultStatus] = useState<string | null>(null);
+  const [dbOnline, setDbOnline] = useState<boolean>(true);
 
   const tabs: { key: SectionKey; label: string; icon: React.ReactNode }[] = [
     { key: 'battery', label: t.tab_battery, icon: <Battery className="w-4 h-4" /> },
@@ -58,6 +60,15 @@ export const SettingsPage: React.FC = () => {
       setSaveMessage({ type: 'error', text: err.message || 'Помилка завантаження' });
     } finally {
       setIsLoading(false);
+    }
+
+    // A degraded database still serves defaults, but saving would fail — warn explicitly
+    // instead of letting the user think the values on screen are persisted.
+    try {
+      const health = await fetchHealth();
+      setDbOnline(Boolean(health.database));
+    } catch {
+      setDbOnline(false);
     }
   };
 
@@ -110,6 +121,16 @@ export const SettingsPage: React.FC = () => {
         <h1 className="text-2xl font-bold text-slate-100">{t.title}</h1>
         <p className="text-sm text-slate-400 mt-1">{t.subtitle}</p>
       </div>
+
+      {!dbOnline && (
+        <div className="p-3.5 rounded-lg text-sm flex items-center gap-2.5 bg-amber-950/60 border border-amber-500/40 text-amber-300">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          <span>
+            База даних недоступна. Показані значення за замовчуванням, збереження не працюватиме.
+            Перевірте <span className="font-mono">DATABASE_URL</span> та стан PostgreSQL.
+          </span>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex border-b border-slate-800 gap-2">

@@ -1,7 +1,8 @@
 """System configuration and settings API endpoints (SPEC §11)."""
 
+import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -13,7 +14,46 @@ from ems.db.models import Setting
 from ems.db.session import get_db
 from ems.market.simulator import MarketTariffs
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/settings", tags=["Settings"])
+
+# Battery fields that are meaningful to the physical simulator and therefore
+# pushed to it over MQTT whenever the operator saves the battery section.
+BATTERY_SIM_FIELDS: tuple[str, ...] = (
+    "capacity_kwh",
+    "power_max_kw",
+    "soc_min_pct",
+    "soc_max_pct",
+    "soc_hard_min_pct",
+    "soc_hard_max_pct",
+    "soc_derate_charge_start_pct",
+    "soc_derate_discharge_start_pct",
+    "eff_charge",
+    "eff_discharge",
+    "self_discharge_pct_day",
+    "aux_load_kw",
+    "aux_from_ac",
+    "ramp_rate_kw_s",
+    "temp_ambient_c",
+    "temp_max_c",
+    "thermal_loss_frac_rated",
+    "cooling_design_delta_t_c",
+    "thermal_mass_kj_per_kwh",
+    "v_nominal_v",
+    "cycle_life",
+    "calendar_fade_pct_per_year",
+    "deg_temp_ref_c",
+    "deg_temp_doubling_k",
+    "capex_uah",
+    "initial_soc_pct",
+)
+
+
+def battery_config_payload(battery: "BatterySettings") -> dict[str, Any]:
+    """Project battery settings onto the field set understood by the BESS simulator."""
+    data = battery.model_dump()
+    return {k: data[k] for k in BATTERY_SIM_FIELDS if k in data}
 
 
 class BatterySettings(BaseModel):
@@ -25,24 +65,56 @@ class BatterySettings(BaseModel):
     soc_max_pct: float = Field(default=90.0, ge=50.0, le=100.0)
     soc_hard_min_pct: float = Field(default=5.0, ge=0.0, le=20.0)
     soc_hard_max_pct: float = Field(default=97.0, ge=80.0, le=100.0)
+    soc_derate_charge_start_pct: float = Field(default=85.0, ge=20.0, le=100.0)
+    soc_derate_discharge_start_pct: float = Field(default=15.0, ge=0.0, le=80.0)
     eff_charge: float = Field(default=0.95, gt=0.5, le=1.0)
     eff_discharge: float = Field(default=0.95, gt=0.5, le=1.0)
     self_discharge_pct_day: float = Field(default=0.1, ge=0.0, le=5.0)
     aux_load_kw: float = Field(default=3.0, ge=0.0, le=50.0)
+    aux_from_ac: bool = Field(
+        default=True,
+        description="Auxiliaries fed from the AC bus (real containerised topology) "
+        "instead of draining the DC pack",
+    )
     ramp_rate_kw_s: float = Field(default=50.0, ge=1.0, le=1000.0)
     temp_ambient_c: float = Field(default=25.0, ge=-30.0, le=60.0)
     temp_max_c: float = Field(default=45.0, ge=30.0, le=80.0)
+    # Scale-invariant thermal design — the simulator derives R_internal, k_cooling,
+    # C_thermal and the pack resistance from these plus capacity/power.
+    thermal_loss_frac_rated: float = Field(default=0.025, ge=0.001, le=0.2)
+    cooling_design_delta_t_c: float = Field(default=10.0, ge=1.0, le=40.0)
+    thermal_mass_kj_per_kwh: float = Field(default=5.0, ge=0.5, le=50.0)
+    v_nominal_v: float = Field(default=780.0, ge=48.0, le=2000.0)
     cycle_life: float = Field(default=6000.0, ge=500.0, le=30000.0)
+    calendar_fade_pct_per_year: float = Field(default=1.5, ge=0.0, le=10.0)
+    deg_temp_ref_c: float = Field(default=25.0, ge=0.0, le=45.0)
+    deg_temp_doubling_k: float = Field(default=10.0, ge=2.0, le=30.0)
     capex_uah: float = Field(default=15000000.0, ge=0.0)
     initial_soc_pct: float = Field(default=50.0, ge=0.0, le=100.0)
+
+    def degradation_cost_uah_per_kwh(self) -> float:
+        """Marginal battery wear cost per kWh of throughput (charge + discharge).
+
+        Lifetime throughput = cycle_life · usable_capacity · 2 (one charge and one
+        discharge per equivalent full cycle), so c_deg = capex / that throughput.
+        """
+        usable_kwh = self.capacity_kwh * max(0.0, self.soc_max_pct - self.soc_min_pct) / 100.0
+        lifetime_kwh = 2.0 * self.cycle_life * usable_kwh
+        if lifetime_kwh <= 0.0:
+            return 0.0
+        return self.capex_uah / lifetime_kwh
 
 
 class StrategySettings(BaseModel):
     """Energy dispatch strategy parameters (SPEC §6.7, §9)."""
 
-    active_strategy: str = Field(
-        default="ARBITRAGE"
-    )  # ARBITRAGE, PEAK_SHAVING, SELF_CONSUMPTION, TOU_SIMPLE
+    active_strategy: Literal[
+        "ARBITRAGE",
+        "PEAK_SHAVING",
+        "SELF_CONSUMPTION",
+        "BACKUP_RESERVE",
+        "TOU_SIMPLE",
+    ] = Field(default="ARBITRAGE")
     w_arbitrage: float = Field(default=1.0, ge=0.0, le=10.0)
     w_peak: float = Field(default=1.0, ge=0.0, le=10.0)
     w_reserve: float = Field(default=1.0, ge=0.0, le=10.0)
@@ -119,16 +191,30 @@ async def get_settings_section(
 
     model_cls = SECTION_MODELS[section_lower]
 
-    stmt = select(Setting).where(Setting.key == section_lower)
-    result = await db.execute(stmt)
-    setting_row = result.scalar_one_or_none()
-
-    if setting_row:
-        # Validate through Pydantic to ensure completeness
-        return model_cls(**setting_row.value).model_dump()
-    else:
-        # Return default instance
+    # The settings form must always render, even when the database is unreachable or
+    # holds a row written by an older schema version — fall back to validated defaults
+    # instead of returning 500 and leaving the UI with an empty parameter list.
+    try:
+        stmt = select(Setting).where(Setting.key == section_lower)
+        result = await db.execute(stmt)
+        setting_row = result.scalar_one_or_none()
+    except Exception as e:
+        logger.warning(
+            "Settings section '%s' unavailable from database (%s) — serving defaults.",
+            section_lower,
+            e,
+        )
         return model_cls().model_dump()
+
+    if setting_row and isinstance(setting_row.value, dict):
+        try:
+            # Validate through Pydantic to ensure completeness
+            return model_cls(**setting_row.value).model_dump()
+        except Exception as e:
+            logger.warning(
+                "Stored settings for '%s' are invalid (%s) — serving defaults.", section_lower, e
+            )
+    return model_cls().model_dump()
 
 
 @router.put("/{section}")
@@ -162,53 +248,125 @@ async def update_settings_section(
         index_elements=["key"],
         set_={"value": validated_dict, "updated_at": datetime.now(UTC)},
     )
-    await db.execute(stmt)
-    await db.commit()
+    try:
+        await db.execute(stmt)
+        await db.commit()
+    except Exception as e:
+        logger.error("Failed to persist settings section '%s': %s", section_lower, e)
+        raise HTTPException(
+            status_code=503,
+            detail="База даних недоступна — налаштування не збережено.",
+        ) from e
+
+    applied = await apply_settings_to_runtime(section_lower, validated_obj)
 
     return {
         "section": section_lower,
         "status": "updated",
         "settings": validated_dict,
+        "applied": applied,
     }
+
+
+async def apply_settings_to_runtime(section: str, validated_obj: BaseModel) -> list[str]:
+    """Push saved settings into the live runtime so they take effect immediately.
+
+    Without this the settings table is write-only: the dispatcher, the market
+    tariffs, the active strategy and the BESS physics all keep running on their
+    construction-time defaults (SPEC §11).
+    """
+    try:
+        from ems.main import app_state
+    except Exception:  # pragma: no cover - import cycle guard for standalone tests
+        return []
+
+    applied: list[str] = []
+
+    if section == "market" and app_state.market is not None:
+        app_state.market.tariffs = validated_obj  # type: ignore[assignment]
+        applied.append("market_tariffs")
+
+    if section == "strategy" and isinstance(validated_obj, StrategySettings):
+        app_state._strategy_name = validated_obj.active_strategy
+        applied.append("active_strategy")
+        if app_state.dispatcher is not None:
+            app_state.dispatcher.config.peak_limit_kw = validated_obj.peak_limit_kw
+            applied.append("dispatcher_peak_limit")
+
+    if section == "ems" and isinstance(validated_obj, EmsCoreSettings):
+        if app_state.dispatcher is not None:
+            app_state.dispatcher.config.soc_tolerance_pct = validated_obj.soc_tolerance_pct
+            applied.append("dispatcher_soc_tolerance")
+
+    if section == "battery" and isinstance(validated_obj, BatterySettings):
+        if app_state.dispatcher is not None:
+            app_state.dispatcher.config.soc_min_pct = validated_obj.soc_min_pct
+            app_state.dispatcher.config.soc_max_pct = validated_obj.soc_max_pct
+            applied.append("dispatcher_soc_limits")
+        app_state.deg_cost_uah_per_kwh = validated_obj.degradation_cost_uah_per_kwh()
+        applied.append("degradation_cost")
+        if app_state.mqtt is not None:
+            app_state.mqtt.publish_config(
+                app_state.settings.bess_id, battery_config_payload(validated_obj)
+            )
+            applied.append("bess_config_published")
+
+    return applied
+
+
+async def load_section(section: str, db: AsyncSession | None = None) -> BaseModel:
+    """Load one settings section from the DB, falling back to validated defaults."""
+    model_cls = SECTION_MODELS[section]
+
+    async def _read(session: AsyncSession) -> BaseModel:
+        stmt = select(Setting).where(Setting.key == section)
+        row = (await session.execute(stmt)).scalar_one_or_none()
+        if row and isinstance(row.value, dict):
+            return model_cls(**row.value)
+        return model_cls()
+
+    try:
+        if db is not None:
+            return await _read(db)
+        from ems.db.session import async_session_factory
+
+        async with async_session_factory() as session:
+            return await _read(session)
+    except Exception as e:
+        logger.warning("Could not load '%s' settings (%s) — using defaults.", section, e)
+        return model_cls()
 
 
 async def get_battery_settings(db: AsyncSession | None = None) -> BatterySettings:
     """Helper to fetch battery settings from DB with fallback to defaults."""
-    if db is not None:
-        stmt = select(Setting).where(Setting.key == "battery")
-        result = await db.execute(stmt)
-        row = result.scalar_one_or_none()
-        if row and isinstance(row.value, dict):
-            return BatterySettings(**row.value)
-        return BatterySettings()
-
-    from ems.db.session import async_session_factory
-
-    async with async_session_factory() as session:
-        stmt = select(Setting).where(Setting.key == "battery")
-        result = await session.execute(stmt)
-        row = result.scalar_one_or_none()
-        if row and isinstance(row.value, dict):
-            return BatterySettings(**row.value)
-        return BatterySettings()
+    result = await load_section("battery", db)
+    assert isinstance(result, BatterySettings)
+    return result
 
 
 async def get_strategy_settings(db: AsyncSession | None = None) -> StrategySettings:
     """Helper to fetch strategy settings from DB with fallback to defaults."""
-    if db is not None:
-        stmt = select(Setting).where(Setting.key == "strategy")
-        result = await db.execute(stmt)
-        row = result.scalar_one_or_none()
-        if row and isinstance(row.value, dict):
-            return StrategySettings(**row.value)
-        return StrategySettings()
+    result = await load_section("strategy", db)
+    assert isinstance(result, StrategySettings)
+    return result
 
-    from ems.db.session import async_session_factory
 
-    async with async_session_factory() as session:
-        stmt = select(Setting).where(Setting.key == "strategy")
-        result = await session.execute(stmt)
-        row = result.scalar_one_or_none()
-        if row and isinstance(row.value, dict):
-            return StrategySettings(**row.value)
-        return StrategySettings()
+async def get_market_tariffs(db: AsyncSession | None = None) -> MarketTariffs:
+    """Helper to fetch market tariff settings from DB with fallback to defaults."""
+    result = await load_section("market", db)
+    assert isinstance(result, MarketTariffs)
+    return result
+
+
+async def get_ems_core_settings(db: AsyncSession | None = None) -> EmsCoreSettings:
+    """Helper to fetch EMS algorithm settings from DB with fallback to defaults."""
+    result = await load_section("ems", db)
+    assert isinstance(result, EmsCoreSettings)
+    return result
+
+
+async def get_simulation_settings(db: AsyncSession | None = None) -> SimulationSettings:
+    """Helper to fetch simulation settings from DB with fallback to defaults."""
+    result = await load_section("simulation", db)
+    assert isinstance(result, SimulationSettings)
+    return result

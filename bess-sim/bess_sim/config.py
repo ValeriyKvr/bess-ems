@@ -1,6 +1,14 @@
-"""Configuration and physical parameters for BESS Simulator (SPEC §5.1)."""
+"""Configuration and physical parameters for BESS Simulator (SPEC §5.1).
 
-from pydantic import BaseModel, Field
+Physical parameters are expressed in *scale-invariant* terms wherever possible
+(loss fraction at rated power, design temperature rise, thermal mass per kWh)
+and the absolute coefficients (r_internal, k_cooling, c_thermal, r_pack_ohm)
+are derived from them at construction time. That way changing capacity_kwh or
+power_max_kw from the UI keeps the thermal and electrical behaviour physically
+consistent instead of silently tripping overheat protection.
+"""
+
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 10-point Open Circuit Voltage (OCV) curve for Lithium Iron Phosphate (LFP) pack (nominal ~780V)
@@ -16,6 +24,8 @@ DEFAULT_LFP_OCV_TABLE: list[tuple[float, float]] = [
     (95.0, 828.0),  # High voltage curve (~3.45 V/cell)
     (100.0, 864.0),  # Full charge (~3.60 V/cell)
 ]
+
+SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
 
 
 class BatteryConfig(BaseModel):
@@ -52,21 +62,61 @@ class BatteryConfig(BaseModel):
     aux_load_kw: float = Field(
         default=3.0, description="Continuous auxiliary system power (HVAC, BMS) in kW"
     )
+    aux_from_ac: bool = Field(
+        default=True,
+        description=(
+            "True: auxiliaries (HVAC/BMS/PCS idle) are fed from the AC bus through the "
+            "auxiliary transformer — the realistic containerised BESS topology. "
+            "False: auxiliaries drain the DC pack."
+        ),
+    )
     ramp_rate_kw_s: float = Field(default=50.0, description="Active power ramp limit in kW/s")
 
     temp_ambient_c: float = Field(default=25.0, description="Ambient temperature in °C")
     temp_max_c: float = Field(
         default=45.0, description="Maximum allowed cell temperature before FAULT in °C"
     )
-    r_internal: float = Field(
-        default=0.00008, description="Internal resistance factor for Joulean heating"
+
+    # ── Scale-invariant thermal / electrical design parameters ──────────────
+    thermal_loss_frac_rated: float = Field(
+        default=0.025,
+        description="Ohmic pack loss at rated power, as a fraction of rated power (2.5% typical)",
     )
-    k_cooling: float = Field(default=0.8, description="Heat dissipation / cooling coefficient")
-    c_thermal: float = Field(
-        default=300.0, description="Thermal mass / heat capacity of battery pack"
+    cooling_design_delta_t_c: float = Field(
+        default=10.0,
+        description="Steady-state cell temperature rise above ambient at rated power, in K",
+    )
+    thermal_mass_kj_per_kwh: float = Field(
+        default=5.0,
+        description="Effective thermal mass of the pack, kJ/K per kWh of installed capacity",
+    )
+    v_nominal_v: float = Field(default=780.0, description="Nominal DC pack voltage in V")
+
+    # Derived coefficients (auto-computed when left as None)
+    r_internal: float | None = Field(
+        default=None, description="Joule heating factor, kW per kW² (derived if None)"
+    )
+    k_cooling: float | None = Field(
+        default=None, description="Heat dissipation coefficient in kW/K (derived if None)"
+    )
+    c_thermal: float | None = Field(
+        default=None, description="Pack heat capacity in kJ/K (derived if None)"
+    )
+    r_pack_ohm: float | None = Field(
+        default=None, description="DC pack ohmic resistance in Ω (derived if None)"
     )
 
+    # ── Degradation ─────────────────────────────────────────────────────────
     cycle_life: float = Field(default=6000.0, description="Full equivalent cycles until 80% SoH")
+    calendar_fade_pct_per_year: float = Field(
+        default=1.5, description="Calendar capacity fade at reference temperature, % per year"
+    )
+    deg_temp_ref_c: float = Field(
+        default=25.0, description="Reference temperature for calendar ageing in °C"
+    )
+    deg_temp_doubling_k: float = Field(
+        default=10.0, description="Temperature rise in K that doubles the calendar fade rate"
+    )
     capex_uah: float = Field(
         default=15000000.0, description="Capital expenditure in UAH for degradation accounting"
     )
@@ -76,13 +126,45 @@ class BatteryConfig(BaseModel):
     )
     seed: int = Field(default=42, description="Random seed for deterministic behavior")
 
+    @model_validator(mode="after")
+    def _derive_physical_coefficients(self) -> "BatteryConfig":
+        """Derive absolute thermal/electrical coefficients from scale-invariant design inputs."""
+        p_rated = max(1.0, self.power_max_kw)
+        loss_at_rated_kw = self.thermal_loss_frac_rated * p_rated
+
+        if self.r_internal is None:
+            # heat_kw = P² · r_internal  ⇒  at rated power heat = loss_frac · P_rated
+            self.r_internal = self.thermal_loss_frac_rated / p_rated
+        if self.k_cooling is None:
+            # Steady state: loss_at_rated = k · ΔT_design
+            self.k_cooling = loss_at_rated_kw / max(0.5, self.cooling_design_delta_t_c)
+        if self.c_thermal is None:
+            self.c_thermal = self.thermal_mass_kj_per_kwh * max(1.0, self.capacity_kwh)
+        if self.r_pack_ohm is None:
+            # loss = I²·R with I = P_rated/V_nom  ⇒  R = loss · V_nom² / P_rated²
+            v_nom = max(1.0, self.v_nominal_v)
+            self.r_pack_ohm = (loss_at_rated_kw * 1000.0) * (v_nom**2) / ((p_rated * 1000.0) ** 2)
+        return self
+
+    def rederive(self) -> "BatteryConfig":
+        """Return a copy with derived coefficients recomputed from current design inputs."""
+        data = self.model_dump()
+        for key in ("r_internal", "k_cooling", "c_thermal", "r_pack_ohm"):
+            data[key] = None
+        return BatteryConfig(**data)
+
 
 class BessConfig(BaseSettings):
-    """Runtime configuration for BESS Simulator process."""
+    """Runtime configuration for BESS Simulator process.
+
+    Nested battery parameters can be overridden from the environment using the
+    ``BATTERY__`` prefix, e.g. ``BATTERY__CAPACITY_KWH=2000``.
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        env_nested_delimiter="__",
         extra="ignore",
     )
 

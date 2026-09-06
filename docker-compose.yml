@@ -8,7 +8,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-ems}
     ports:
-      - "5432:5432"
+      # Host port is only for debugging with an external client — services talk to
+      # "timescaledb:5432" over the compose network. Defaults to 5433 so the stack
+      # still starts when a native PostgreSQL already owns 5432 on the host.
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -53,6 +56,12 @@ services:
       EMS_HOST: 0.0.0.0
       EMS_PORT: 8000
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Must match the simulator, otherwise the EMS subscribes to one BESS id and
+      # dispatches setpoints/config to another — no telemetry, no control.
+      BESS_ID: ${BESS_ID:-bess-01}
+      SIM_SPEED: ${SIM_SPEED:-60}
+      SIM_START_TIME: ${SIM_START_TIME:-2026-03-01T00:00:00Z}
+      SIM_TICK_SECONDS: ${SIM_TICK_SECONDS:-60}
     ports:
       - "8000:8000"
     depends_on:
@@ -78,6 +87,7 @@ services:
       MQTT_BROKER_PORT: 1883
       BESS_ID: ${BESS_ID:-bess-01}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      BESS_SIM_TELEMETRY_INTERVAL_MS: ${BESS_SIM_TELEMETRY_INTERVAL_MS:-1000}
     ports:
       - "5020:5020"
     depends_on:

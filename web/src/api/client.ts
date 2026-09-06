@@ -1,5 +1,26 @@
 import { SystemStatus, HealthResponse, MlModelInfo, ForecastPoint, BacktestResult } from '../types';
 
+/**
+ * FastAPI returns `detail` either as a string or as a list of validation objects.
+ * Rendering the object directly produces "[object Object]", which hides the reason
+ * the save failed — flatten it to readable text instead.
+ */
+async function errorText(response: Response, fallback: string): Promise<string> {
+  const body = await response.json().catch(() => null);
+  const detail = (body as any)?.detail;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d: any) => {
+        const loc = Array.isArray(d?.loc) ? d.loc.filter((p: any) => p !== 'body').join('.') : '';
+        return loc ? `${loc}: ${d?.msg ?? ''}` : String(d?.msg ?? JSON.stringify(d));
+      })
+      .join('; ');
+  }
+  if (detail) return JSON.stringify(detail);
+  return fallback;
+}
+
 export async function fetchSystemStatus(): Promise<SystemStatus> {
   const response = await fetch('/api/status');
   if (!response.ok) {
@@ -106,8 +127,7 @@ export async function updateSettingsSection(
     body: JSON.stringify(payload),
   });
   if (!response.ok) {
-    const err = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(err.detail || `Failed to update ${section}`);
+    throw new Error(await errorText(response, `Failed to update ${section}`));
   }
   return response.json();
 }
@@ -157,8 +177,7 @@ export async function importCsvData(
     body: formData,
   });
   if (!response.ok) {
-    const err = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(err.detail || `Failed to import CSV`);
+    throw new Error(await errorText(response, 'Failed to import CSV'));
   }
   return response.json();
 }
@@ -175,8 +194,7 @@ export async function generateSyntheticData(payload: {
     body: JSON.stringify(payload),
   });
   if (!response.ok) {
-    const err = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(err.detail || 'Failed to generate synthetic data');
+    throw new Error(await errorText(response, 'Failed to generate synthetic data'));
   }
   return response.json();
 }

@@ -30,11 +30,18 @@ export interface BessTelemetryTick {
   temp_c?: number;
   state?: string;
   alarms?: Record<string, unknown> | unknown[];
+  aux_kw?: number;
+  heat_kw?: number;
+  capacity_actual_kwh?: number;
+  available_charge_kw?: number;
+  available_discharge_kw?: number;
 }
 
 export interface SiteTick {
   load_kw: number;
   pv_kw: number;
+  /** BESS auxiliary draw (HVAC, BMS, PCS idle) fed from the AC bus */
+  aux_kw?: number;
 }
 
 export interface GridTick {

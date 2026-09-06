@@ -219,7 +219,7 @@ docker compose up --build
 | **EMS Core API Docs** | [http://localhost:8000/docs](http://localhost:8000/docs) | Swagger / OpenAPI документація |
 | **MQTT Broker** | `localhost:1883` | Брокер повідомлень Mosquitto |
 | **Modbus TCP Server** | `localhost:5020` | Промисловий інтерфейс BESS |
-| **TimescaleDB** | `localhost:5432` | База даних часових рядів (user: `postgres`, db: `ems`) |
+| **TimescaleDB** | `localhost:5433` | База даних часових рядів (user: `postgres`, db: `ems`). Порт хоста задається через `POSTGRES_HOST_PORT`; за замовчуванням 5433, щоб не конфліктувати з локально встановленим PostgreSQL на 5432. Всередині Docker-мережі сервіси звертаються до `timescaledb:5432` |
 
 ---
 

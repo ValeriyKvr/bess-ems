@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import math
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
@@ -22,6 +21,7 @@ from ems.db.models import DamPrice, DispatchLog, SiteLoad
 from ems.db.models import Schedule as ScheduleModel
 from ems.db.session import async_session_factory, engine
 from ems.dispatch.dispatcher import Dispatcher, DispatcherConfig
+from ems.ingestion.generator import SyntheticDataGenerator
 from ems.market.financials import compute_hourly_financials, record_hourly_financials
 from ems.market.simulator import (
     MarketSimulator,
@@ -43,6 +43,19 @@ logging.basicConfig(
 logger = logging.getLogger("ems-core")
 
 
+def _new_hour_accumulator() -> dict[str, float]:
+    """Fresh energy accumulator for one simulated hour."""
+    return {
+        "load_kwh": 0.0,
+        "pv_kwh": 0.0,
+        "aux_kwh": 0.0,
+        "charge_kwh": 0.0,
+        "discharge_kwh": 0.0,
+        "price_dam_weighted": 0.0,
+        "hours": 0.0,
+    }
+
+
 class ApplicationState:
     """Container holding runtime services."""
 
@@ -60,6 +73,26 @@ class ApplicationState:
         self._current_sim_date: date | None = None
         self._today_net_uah: float = 0.0
         self._today_baseline_uah: float = 0.0
+
+        # Marginal battery wear cost, derived from capex / cycle life / usable capacity
+        # (SPEC §7). Recomputed whenever the battery section is saved.
+        self.deg_cost_uah_per_kwh: float = 1.5625
+
+        # Energy accumulated over the current simulated hour, so hourly settlement
+        # integrates real power over time instead of sampling the instantaneous value
+        # at the hour boundary.
+        self._hour_acc: dict[str, float] = _new_hour_accumulator()
+        self._prev_hour_acc: dict[str, float] | None = None
+        self._acc_hour: datetime | None = None
+
+        # Deterministic fallback generator (same seed/profile as the seeded database)
+        self._fallback_generator = SyntheticDataGenerator(seed=42)
+
+        # Index of the last dispatcher event pushed to WebSocket clients
+        self._last_event_index: int = 0
+
+        # Backoff for on-the-fly schedule construction when the DB is unavailable
+        self._last_schedule_attempt: datetime | None = None
 
 
 app_state = ApplicationState()
@@ -92,37 +125,63 @@ async def preload_telemetry_cache(target_dt: datetime) -> None:
         logger.warning("Failed to preload telemetry cache: %s", e)
 
 
+def _synthetic_hour(hour_dt: datetime) -> tuple[float, float, float]:
+    """Generate (price_dam, load_kw, pv_kw) for one hour with the seeded generator.
+
+    Uses the same SyntheticDataGenerator that fills the database, so a cache miss
+    produces a profile consistent with the stored history instead of a different
+    ad-hoc sine curve.
+    """
+    gen = app_state._fallback_generator
+    price_df = gen.generate_dam_prices(start_dt=hour_dt, end_dt=hour_dt)
+    load_df = gen.generate_site_load(start_dt=hour_dt, end_dt=hour_dt)
+    price = float(price_df.iloc[0]["price_uah_mwh"]) if len(price_df) else 4500.0
+    load = float(load_df.iloc[0]["load_kw"]) if len(load_df) else 300.0
+    pv = float(load_df.iloc[0]["pv_kw"]) if len(load_df) else 0.0
+    return price, load, pv
+
+
+def _hour_sample(hour_dt: datetime) -> tuple[float, float, float]:
+    """Return (price_dam, load_kw, pv_kw) for an hour, preferring the DB cache."""
+    price = app_state._price_cache.get(hour_dt)
+    load_pv = app_state._load_cache.get(hour_dt)
+    if price is not None and load_pv is not None:
+        return price, load_pv[0], load_pv[1]
+
+    syn_price, syn_load, syn_pv = _synthetic_hour(hour_dt)
+    if price is None:
+        price = syn_price
+        app_state._price_cache[hour_dt] = price
+    if load_pv is None:
+        load_pv = (syn_load, syn_pv)
+        app_state._load_cache[hour_dt] = load_pv
+
+    # Bound memory during long fast-forward runs (keep ~1 year of hourly samples)
+    for cache in (app_state._price_cache, app_state._load_cache):
+        if len(cache) > 10000:
+            for key in sorted(cache)[:2000]:
+                cache.pop(key, None)
+
+    return price, load_pv[0], load_pv[1]
+
+
 def _get_current_market_and_site(sim_time: datetime) -> tuple[float, float, float]:
-    """Get (price_dam, load_kw, pv_kw) for sim_time with synthetic fallback."""
+    """Get (price_dam, load_kw, pv_kw) for sim_time.
+
+    The DAM price is a step function held constant across the settlement hour (that
+    is how the market actually clears), while load and PV are linearly interpolated
+    between hourly samples so the physical model sees a continuous profile instead
+    of hourly jumps.
+    """
     hour_dt = sim_time.replace(minute=0, second=0, microsecond=0)
-    hour = sim_time.hour + sim_time.minute / 60.0
+    next_hour_dt = hour_dt + timedelta(hours=1)
+    frac = (sim_time - hour_dt).total_seconds() / 3600.0
 
-    # 1. DAM Price
-    if hour_dt in app_state._price_cache:
-        price_dam = app_state._price_cache[hour_dt]
-    else:
-        # Realistic synthetic fallback: morning & evening peak
-        if 7.0 <= hour <= 10.0 or 17.0 <= hour <= 22.0:
-            price_dam = 5800.0 + 800.0 * math.sin(math.pi * hour / 12.0) ** 2
-        elif 0.0 <= hour <= 6.0:
-            price_dam = 3100.0 + 300.0 * math.sin(math.pi * hour / 6.0)
-        else:
-            price_dam = 4200.0 + 400.0 * math.cos(math.pi * hour / 12.0)
+    price_dam, load_now, pv_now = _hour_sample(hour_dt)
+    _, load_next, pv_next = _hour_sample(next_hour_dt)
 
-    # 2. Load & PV
-    if hour_dt in app_state._load_cache:
-        load_kw, pv_kw = app_state._load_cache[hour_dt]
-    else:
-        # Realistic synthetic fallback matching SyntheticDataGenerator
-        if 7.0 <= hour <= 21.5:
-            load_kw = 320.0 + 130.0 * math.sin(math.pi * (hour - 7.0) / 14.5) ** 2
-        else:
-            load_kw = 180.0 + 25.0 * math.sin(math.pi * hour / 7.0)
-
-        if 8.0 <= hour <= 17.5:
-            pv_kw = max(0.0, 184.0 * math.sin(math.pi * (hour - 8.0) / 9.5))
-        else:
-            pv_kw = 0.0
+    load_kw = load_now + (load_next - load_now) * frac
+    pv_kw = max(0.0, pv_now + (pv_next - pv_now) * frac)
 
     return price_dam, load_kw, pv_kw
 
@@ -132,44 +191,43 @@ async def on_hour_transition(new_hour_start: datetime) -> None:
     prev_hour = new_hour_start - timedelta(hours=1)
     logger.debug("Processing hourly settlement for hour: %s", prev_hour)
 
-    # 1. Financial settlement for elapsed hour
+    # 1. Financial settlement for the elapsed hour, using the energy integrated over
+    #    that hour by the tick loop rather than the instantaneous power at the boundary.
+    acc = app_state._prev_hour_acc or app_state._hour_acc
+    app_state._prev_hour_acc = None
+    elapsed_h = acc.get("hours", 0.0)
+
     try:
+        market_sim = app_state.market or MarketSimulator()
+
+        if elapsed_h > 0.05:
+            load_kwh = acc["load_kwh"]
+            aux_kwh = acc["aux_kwh"]
+            pv_kwh = acc["pv_kwh"]
+            ch_kwh = acc["charge_kwh"]
+            dis_kwh = acc["discharge_kwh"]
+            price_dam = acc["price_dam_weighted"] / elapsed_h
+        else:
+            # Cold start (no ticks accumulated yet) — fall back to the stored profile
+            price_dam, load_kw, pv_kw = _get_current_market_and_site(prev_hour)
+            load_kwh, pv_kwh, ch_kwh, dis_kwh = load_kw, pv_kw, 0.0, 0.0
+            aux_kwh = 0.0
+
+        price_buy = calculate_buy_price(price_dam, market_sim.tariffs)
+        price_sell = calculate_sell_price(price_dam, market_sim.tariffs)
+
+        fin_result = compute_hourly_financials(
+            ts=prev_hour,
+            load_kwh=load_kwh,
+            pv_kwh=pv_kwh,
+            charge_kwh=ch_kwh,
+            discharge_kwh=dis_kwh,
+            price_buy_uah_mwh=price_buy,
+            price_sell_uah_mwh=price_sell,
+            c_deg_uah_kwh=app_state.deg_cost_uah_per_kwh,
+            aux_kwh=aux_kwh,
+        )
         async with async_session_factory() as session:
-            # Query load & PV for prev_hour
-            load_stmt = select(SiteLoad).where(SiteLoad.ts == prev_hour)
-            load_row = (await session.execute(load_stmt)).scalar_one_or_none()
-            load_kwh = load_row.load_kw if load_row else 100.0
-            pv_kwh = load_row.pv_kw if load_row else 0.0
-
-            # Query DAM price for prev_hour
-            price_stmt = select(DamPrice).where(DamPrice.ts == prev_hour)
-            price_row = (await session.execute(price_stmt)).scalar_one_or_none()
-            price_dam = price_row.price_uah_mwh if price_row else 4500.0
-
-            # Compute effective buy/sell tariffs
-            market_sim = app_state.market or MarketSimulator()
-            price_buy = calculate_buy_price(price_dam, market_sim.tariffs)
-            price_sell = calculate_sell_price(price_dam, market_sim.tariffs)
-
-            # Retrieve BESS power if available from MQTT cache
-            bess_power = 0.0
-            if app_state.mqtt and app_state.mqtt.latest_bess_telemetry:
-                bess_id = app_state.settings.bess_id
-                tdata = app_state.mqtt.latest_bess_telemetry.get(bess_id, {})
-                bess_power = float(tdata.get("power_kw", 0.0))
-
-            ch_kwh = max(0.0, bess_power)  # 1 hour * power
-            dis_kwh = max(0.0, -bess_power)
-
-            fin_result = compute_hourly_financials(
-                ts=prev_hour,
-                load_kwh=load_kwh,
-                pv_kwh=pv_kwh,
-                charge_kwh=ch_kwh,
-                discharge_kwh=dis_kwh,
-                price_buy_uah_mwh=price_buy,
-                price_sell_uah_mwh=price_sell,
-            )
             await record_hourly_financials(fin_result, session)
     except Exception as e:
         logger.error("Failed to compute hourly financials for %s: %s", prev_hour, e)
@@ -239,6 +297,9 @@ async def _build_preliminary_schedule_with_forecast(sim_dt: datetime) -> None:
 
         strategy = get_strategy(app_state._strategy_name)
         schedule = strategy.build_schedule(context)
+        schedule.params["start_soc_pct"] = soc_pct
+        schedule.params["eff_charge"] = bat_cfg.eff_charge
+        schedule.params["eff_discharge"] = bat_cfg.eff_discharge
 
         await _persist_schedule(schedule)
         app_state.dispatcher.set_schedule(schedule)
@@ -370,6 +431,9 @@ async def _build_schedule_for_date(target_date: date, sim_dt: datetime) -> None:
             n_discharge_hours=app_state._n_discharge_hours,
         )
         schedule = strategy.build_schedule(context)
+        schedule.params["start_soc_pct"] = soc_pct
+        schedule.params["eff_charge"] = bat_cfg.eff_charge
+        schedule.params["eff_discharge"] = bat_cfg.eff_discharge
 
         # Persist schedule to database
         await _persist_schedule(schedule)
@@ -480,6 +544,9 @@ async def on_rolling_reopt_trigger(sim_time: datetime, current_soc: float) -> No
         )
         strategy = get_strategy(app_state._strategy_name)
         new_schedule = strategy.build_schedule(context)
+        new_schedule.params["start_soc_pct"] = current_soc
+        new_schedule.params["eff_charge"] = bat_cfg.eff_charge
+        new_schedule.params["eff_discharge"] = bat_cfg.eff_discharge
 
         await _persist_schedule(new_schedule)
         app_state.dispatcher.set_schedule(new_schedule)
@@ -501,18 +568,97 @@ async def on_rolling_reopt_trigger(sim_time: datetime, current_soc: float) -> No
         logger.error("Failed rolling re-optimization: %s", e)
 
 
+def _bess_telemetry() -> dict[str, Any]:
+    """Latest telemetry frame for the configured BESS, or an empty dict."""
+    if app_state.mqtt and app_state.mqtt.latest_bess_telemetry:
+        return app_state.mqtt.latest_bess_telemetry.get(app_state.settings.bess_id, {}) or {}
+    return {}
+
+
+def _planned_soc_pct(sim_time: datetime) -> float | None:
+    """Integrate the active schedule to the planned SoC at sim_time (SPEC §6.5).
+
+    Returns None when there is no usable schedule, no capacity information, or no
+    telemetry to anchor the trajectory on.
+    """
+    schedule = app_state.dispatcher.active_schedule if app_state.dispatcher else None
+    if schedule is None or not schedule.items:
+        return None
+    capacity_kwh = schedule.capacity_kwh
+    if capacity_kwh <= 0:
+        return None
+
+    anchor = schedule.params.get("start_soc_pct") if schedule.params else None
+    if anchor is None:
+        return None
+
+    # Mirror the battery's energy conversion, otherwise the plan drifts above the
+    # measured SoC on every charge and trips the deviation check spuriously.
+    eff_ch = float(schedule.params.get("eff_charge", 1.0))
+    eff_dis = float(schedule.params.get("eff_discharge", 1.0))
+
+    energy_kwh = capacity_kwh * (float(anchor) / 100.0)
+    for item in sorted(schedule.items, key=lambda i: i.ts):
+        if item.ts >= sim_time:
+            break
+        span_h = min(1.0, max(0.0, (sim_time - item.ts).total_seconds() / 3600.0))
+        power = item.setpoint_kw
+        if power > 0.0:
+            energy_kwh += power * span_h * eff_ch
+        elif power < 0.0 and eff_dis > 0.0:
+            energy_kwh += power * span_h / eff_dis
+
+    return max(0.0, min(100.0, energy_kwh / capacity_kwh * 100.0))
+
+
+def _accumulate_hour_energy(
+    sim_time: datetime,
+    delta_seconds: float,
+    price_dam: float,
+    load_kw: float,
+    pv_kw: float,
+) -> None:
+    """Integrate power over the tick into the current simulated hour's energy totals."""
+    hour_dt = sim_time.replace(minute=0, second=0, microsecond=0)
+    if app_state._acc_hour is not None and hour_dt != app_state._acc_hour:
+        app_state._prev_hour_acc = app_state._hour_acc
+        app_state._hour_acc = _new_hour_accumulator()
+    app_state._acc_hour = hour_dt
+
+    dt_hours = max(0.0, delta_seconds) / 3600.0
+    if dt_hours <= 0.0:
+        return
+
+    tdata = _bess_telemetry()
+    bess_power = float(tdata.get("power_kw", 0.0))
+    aux_kw = float(tdata.get("aux_kw", 0.0))
+
+    acc = app_state._hour_acc
+    acc["load_kwh"] += load_kw * dt_hours
+    acc["pv_kwh"] += pv_kw * dt_hours
+    acc["aux_kwh"] += aux_kw * dt_hours
+    acc["charge_kwh"] += max(0.0, bess_power) * dt_hours
+    acc["discharge_kwh"] += max(0.0, -bess_power) * dt_hours
+    acc["price_dam_weighted"] += price_dam * dt_hours
+    acc["hours"] += dt_hours
+
+
 def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
     """Handle each simulation clock tick: run dispatcher, update WebSocket."""
     if not app_state.dispatcher or not app_state.clock:
         return
 
-    # Check if active schedule exists for current time; if not, build on the fly
+    # Check if active schedule exists for current time; if not, build on the fly.
+    # Rate-limited: a failing build (e.g. database down) must not spam one task per tick.
     active = app_state.dispatcher.active_schedule
     if active is None or sim_time < active.horizon_start or sim_time >= active.horizon_end:
-        try:
-            asyncio.create_task(_build_schedule_for_date(sim_time.date(), sim_time))
-        except RuntimeError:
-            pass
+        last_try = app_state._last_schedule_attempt
+        if last_try is None or (sim_time - last_try) >= timedelta(minutes=15):
+            app_state._last_schedule_attempt = sim_time
+            try:
+                asyncio.create_task(_build_schedule_for_date(sim_time.date(), sim_time))
+            except RuntimeError:
+                pass
 
     # Retrieve current market price and site telemetry
     price_dam, load_kw, pv_kw = _get_current_market_and_site(sim_time)
@@ -521,13 +667,15 @@ def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
     app_state.dispatcher.update_site_load(load_kw)
 
     # Update dispatcher with latest telemetry from MQTT
+    bess_soc_pct: float | None = None
     if app_state.mqtt and app_state.mqtt.latest_bess_telemetry:
         bess_id = app_state.settings.bess_id
         tdata = app_state.mqtt.latest_bess_telemetry.get(bess_id, {})
         if tdata:
+            bess_soc_pct = float(tdata.get("soc_pct", 50.0))
             app_state.dispatcher.update_telemetry(
                 sim_time=sim_time,
-                soc_pct=float(tdata.get("soc_pct", 50.0)),
+                soc_pct=bess_soc_pct,
                 state=str(tdata.get("state", "STANDBY")),
                 power_kw=float(tdata.get("power_kw", 0.0)),
                 temp_c=float(tdata.get("temp_c", 25.0)),
@@ -535,6 +683,12 @@ def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
 
     # Run dispatcher tick
     decision = app_state.dispatcher.tick(sim_time)
+
+    # Closed-loop check: does the measured SoC still track the plan? (SPEC §6.5)
+    if bess_soc_pct is not None:
+        planned_soc = _planned_soc_pct(sim_time)
+        if planned_soc is not None:
+            app_state.dispatcher.check_reoptimization_needed(sim_time, bess_soc_pct, planned_soc)
 
     # Publish setpoint to MQTT (include both setpoint_kw and power_kw for compatibility)
     if app_state.mqtt and app_state.mqtt.is_connected:
@@ -549,6 +703,9 @@ def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
                 "reason": decision.reason,
             },
         )
+
+    # Integrate energy over this tick for the hourly settlement
+    _accumulate_hour_energy(sim_time, delta_seconds, price_dam, load_kw, pv_kw)
 
     # Persist to DB (async, fire-and-forget)
     try:
@@ -586,9 +743,11 @@ def _broadcast_ws_tick(
         bess_data = app_state.mqtt.latest_bess_telemetry.get(bess_id, {})
 
     bess_power = float(bess_data.get("power_kw", decision.setpoint_kw if decision else 0.0))
+    aux_kw = float(bess_data.get("aux_kw", 0.0))
 
-    # Grid import / export balance
-    net_facility = load_kw - pv_kw + bess_power
+    # Grid import / export balance. BESS auxiliaries (HVAC, BMS, PCS idle draw) are fed
+    # from the AC bus, so they add to what the site imports.
+    net_facility = load_kw + aux_kw - pv_kw + bess_power
     grid_import = max(0.0, net_facility)
     grid_export = max(0.0, -net_facility)
 
@@ -615,7 +774,7 @@ def _broadcast_ws_tick(
     cost_actual = (
         grid_import * (price_buy / 1000.0) - grid_export * (price_sell / 1000.0)
     ) * dt_hours
-    deg_cost = 1.25 * abs(bess_power) * dt_hours
+    deg_cost = app_state.deg_cost_uah_per_kwh * abs(bess_power) * dt_hours
     net_saving = cost_baseline - cost_actual - deg_cost
 
     app_state._today_baseline_uah += cost_baseline
@@ -629,6 +788,7 @@ def _broadcast_ws_tick(
         "site": {
             "load_kw": round(load_kw, 2),
             "pv_kw": round(pv_kw, 2),
+            "aux_kw": round(aux_kw, 2),
         },
         "grid": {
             "import_kw": round(grid_import, 2),
@@ -658,14 +818,71 @@ def _broadcast_ws_events() -> None:
     if not app_state.dispatcher or ws_manager.connection_count == 0:
         return
 
-    # Check for new events (simple approach: track last broadcast index)
+    # Only broadcast events that have not been sent yet — re-sending the tail on every
+    # tick floods the UI event feed with duplicates.
     events = app_state.dispatcher.event_log
-    if events:
-        latest = events[-1]
+    if app_state._last_event_index > len(events):
+        app_state._last_event_index = 0
+    pending = events[app_state._last_event_index :]
+    if not pending:
+        return
+    app_state._last_event_index = len(events)
+    for event in pending:
         try:
-            asyncio.create_task(ws_manager.broadcast_event(latest))
+            asyncio.create_task(ws_manager.broadcast_event(event))
         except RuntimeError:
             pass
+
+
+async def _publish_bess_config(payload: dict[str, Any]) -> None:
+    """Publish the retained BESS config once the MQTT connection is established."""
+    for _ in range(30):
+        if app_state.mqtt and app_state.mqtt.is_connected:
+            app_state.mqtt.publish_config(app_state.settings.bess_id, payload)
+            return
+        await asyncio.sleep(1.0)
+    logger.warning("MQTT never connected — BESS configuration was not published.")
+
+
+async def _load_runtime_settings() -> dict[str, Any]:
+    """Load persisted settings and configure market, dispatcher and strategy from them.
+
+    Called on startup so that operator parameters saved in the UI actually govern the
+    running system, instead of the services keeping their construction-time defaults.
+    """
+    from ems.api.settings import (
+        battery_config_payload,
+        get_ems_core_settings,
+        get_market_tariffs,
+    )
+
+    battery = await get_battery_settings()
+    strategy = await get_strategy_settings()
+    tariffs = await get_market_tariffs()
+    ems_cfg = await get_ems_core_settings()
+
+    if app_state.market is not None:
+        app_state.market.tariffs = tariffs
+
+    app_state._strategy_name = strategy.active_strategy
+    app_state.deg_cost_uah_per_kwh = battery.degradation_cost_uah_per_kwh()
+
+    if app_state.dispatcher is not None:
+        app_state.dispatcher.config.soc_min_pct = battery.soc_min_pct
+        app_state.dispatcher.config.soc_max_pct = battery.soc_max_pct
+        app_state.dispatcher.config.peak_limit_kw = strategy.peak_limit_kw
+        app_state.dispatcher.config.soc_tolerance_pct = ems_cfg.soc_tolerance_pct
+
+    logger.info(
+        "Runtime settings applied: strategy=%s, capacity=%.0f kWh, power=%.0f kW, "
+        "peak_limit=%.0f kW, c_deg=%.3f UAH/kWh",
+        app_state._strategy_name,
+        battery.capacity_kwh,
+        battery.power_max_kw,
+        strategy.peak_limit_kw,
+        app_state.deg_cost_uah_per_kwh,
+    )
+    return battery_config_payload(battery)
 
 
 @asynccontextmanager
@@ -692,6 +909,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app_state.clock.register_tick_callback(on_clock_tick)
 
     # 4. Check Database connectivity and run seed if needed
+    bess_config_payload: dict[str, Any] = {}
     try:
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
@@ -703,6 +921,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
             async with async_session_factory() as session:
                 await ensure_db_initialized_and_seeded(session)
+
+            bess_config_payload = await _load_runtime_settings()
 
             # Preload telemetry cache & create Day 1 initial schedule
             if app_state.clock:
@@ -723,6 +943,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app_state.mqtt.connect()
     telemetry_flush_task = asyncio.create_task(app_state.mqtt.start_telemetry_flusher())
 
+    # Push the operator's battery parameters to the simulator as a retained message,
+    # so the physical model matches the configuration shown in the UI.
+    config_push_task: asyncio.Task[None] | None = None
+    if bess_config_payload:
+        config_push_task = asyncio.create_task(_publish_bess_config(bess_config_payload))
+
     # 6. Start Clock background loop
     def publish_clock_mqtt(clock_dict: dict) -> None:
         if app_state.mqtt and app_state.mqtt.is_connected:
@@ -742,6 +968,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     clock_loop_task.cancel()
     telemetry_flush_task.cancel()
     ws_flush_task.cancel()
+    if config_push_task is not None:
+        config_push_task.cancel()
 
     await ws_manager.close_all()
 

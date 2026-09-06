@@ -34,18 +34,24 @@ def compute_hourly_financials(
     price_buy_uah_mwh: float,
     price_sell_uah_mwh: float,
     c_deg_uah_kwh: float = 1.25,
+    aux_kwh: float = 0.0,
 ) -> FinancialHourResult:
     """Calculate hourly financial metrics matching SPEC §6.2.
 
     Baseline: Without BESS (Import = max(0, load - pv)).
-    Actual: With BESS (Net = load - pv + charge - discharge).
+    Actual: With BESS (Net = load + aux - pv + charge - discharge).
+
+    ``aux_kwh`` is the BESS auxiliary consumption (HVAC, BMS, PCS idle). It exists
+    only because the battery is installed, so it is charged to the actual case and
+    left out of the baseline — otherwise the auxiliaries cancel out of the net
+    benefit and appear free.
     """
     # 1. Baseline calculation (Facility without battery storage)
     baseline_import_kwh = max(0.0, load_kwh - pv_kwh)
     cost_baseline_uah = baseline_import_kwh * (price_buy_uah_mwh / 1000.0)
 
     # 2. Actual system with BESS
-    net_flow_kwh = load_kwh - pv_kwh + charge_kwh - discharge_kwh
+    net_flow_kwh = load_kwh + aux_kwh - pv_kwh + charge_kwh - discharge_kwh
     if net_flow_kwh >= 0.0:
         actual_import_kwh = net_flow_kwh
         actual_export_kwh = 0.0

@@ -47,7 +47,25 @@ class BessSimulatorApp:
             on_clock_tick=self.on_clock_tick,
             on_setpoint=self.on_setpoint,
             on_command=self.on_command,
+            on_config=self.on_config,
         )
+
+    def on_config(self, payload: dict[str, Any]) -> None:
+        """Apply battery parameters pushed by the EMS settings API (retained topic)."""
+        params = payload.get("battery", payload)
+        if not isinstance(params, dict):
+            logger.warning("Ignoring malformed config payload: %s", payload)
+            return
+        try:
+            changed = self.battery.apply_config(params)
+        except Exception as e:
+            logger.error("Failed to apply EMS config update: %s", e)
+            return
+        if changed:
+            self.mqtt.publish_status(
+                str(self.battery.bms.state),
+                f"Configuration updated from EMS: {', '.join(changed)}",
+            )
 
     def _on_modbus_setpoint(self, setpoint_kw: float) -> None:
         """Handle active power setpoint received via Modbus TCP (SPEC §4.2)."""

@@ -23,11 +23,13 @@ class BessMqttClient:
         on_clock_tick: Callable[[dict[str, Any]], None] | None = None,
         on_setpoint: Callable[[dict[str, Any]], None] | None = None,
         on_command: Callable[[dict[str, Any]], None] | None = None,
+        on_config: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.config = config
         self.on_clock_tick = on_clock_tick
         self.on_setpoint = on_setpoint
         self.on_command = on_command
+        self.on_config = on_config
 
         self.client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -75,6 +77,10 @@ class BessMqttClient:
             ("sim/clock", 0),
             (f"ems/{self.config.bess_id}/setpoint", 1),
             (f"ems/{self.config.bess_id}/command", 1),
+            # Retained topic: the EMS republishes it on every settings change, and the
+            # broker replays the last value on reconnect, so the simulator always picks
+            # up the operator's parameters regardless of service start order.
+            (f"ems/{self.config.bess_id}/config", 1),
         ]
         self.client.subscribe(topics)
         logger.info("BESS subscribed to topics: %s", topics)
@@ -103,6 +109,8 @@ class BessMqttClient:
             self.on_setpoint(payload)
         elif msg.topic == f"ems/{self.config.bess_id}/command" and self.on_command:
             self.on_command(payload)
+        elif msg.topic == f"ems/{self.config.bess_id}/config" and self.on_config:
+            self.on_config(payload)
 
     def connect(self) -> None:
         """Connect to MQTT broker and start network loop."""

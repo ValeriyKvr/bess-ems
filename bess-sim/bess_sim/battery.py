@@ -1,6 +1,7 @@
 """Battery cell, pack physics and telemetry generator (SPEC §5.1, §5.2)."""
 
 import logging
+import math
 import random
 from dataclasses import dataclass
 from typing import Any
@@ -34,10 +35,16 @@ class BatteryTelemetryData:
     available_charge_kw: float
     available_discharge_kw: float
     alarms: list[str]
+    aux_kw: float = 0.0
+    heat_kw: float = 0.0
+    capacity_actual_kwh: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON MQTT publication."""
         return {
+            "aux_kw": round(self.aux_kw, 3),
+            "heat_kw": round(self.heat_kw, 3),
+            "capacity_actual_kwh": round(self.capacity_actual_kwh, 2),
             "ts_sim": self.ts_sim,
             "ts_wall": self.ts_wall,
             "bess_id": self.bess_id,
@@ -70,13 +77,16 @@ class Battery:
         self.pcs = PcsModel(self.config.power_max_kw, self.config.ramp_rate_kw_s)
         self.thermal = ThermalModel(
             temp_ambient_c=self.config.temp_ambient_c,
-            r_internal=self.config.r_internal,
-            k_cooling=self.config.k_cooling,
-            c_thermal=self.config.c_thermal,
+            r_internal=self.config.r_internal or 0.00005,
+            k_cooling=self.config.k_cooling or 1.25,
+            c_thermal=self.config.c_thermal or 5000.0,
         )
         self.degradation = DegradationModel(
             capacity_nominal_kwh=self.config.capacity_kwh,
             cycle_life=self.config.cycle_life,
+            calendar_fade_pct_per_year=self.config.calendar_fade_pct_per_year,
+            temp_ref_c=self.config.deg_temp_ref_c,
+            temp_doubling_k=self.config.deg_temp_doubling_k,
         )
 
         # Dynamic state
@@ -168,8 +178,12 @@ class Battery:
                 * (dt_seconds / 86400.0)
             )
 
+        # Auxiliaries (HVAC, BMS, PCS idle draw). In a real containerised BESS they are
+        # fed from the AC bus via the auxiliary transformer, so they do NOT drain the DC
+        # pack — they show up as extra site load. aux_from_ac=False restores DC draw.
+        aux_kw = self.config.aux_load_kw if include_aux else 0.0
         aux_load_kwh = 0.0
-        if include_aux and self.config.aux_load_kw > 0.0:
+        if include_aux and self.config.aux_load_kw > 0.0 and not self.config.aux_from_ac:
             aux_load_kwh = self.config.aux_load_kw * dt_hours
 
         # Net SoE update
@@ -181,21 +195,44 @@ class Battery:
             else 0.0
         )
 
-        # Step 4: Thermal Dynamics
-        temp_c = self.thermal.step(actual_power_kw, dt_seconds)
+        # Step 4: Electrical solution — terminal voltage, current and ohmic loss.
+        # The pack behaves as an OCV source in series with R: P = (OCV + I·R)·I,
+        # so the terminal current is the root of R·I² + OCV·I − P = 0.
+        ocv_v = self._calculate_ocv(self.soc_pct)
+        r_ohm = self.config.r_pack_ohm or 0.0
+        p_w = actual_power_kw * 1000.0
+        if ocv_v <= 0.0:
+            self.current_a = 0.0
+        elif r_ohm <= 0.0:
+            self.current_a = p_w / ocv_v
+        else:
+            discriminant = ocv_v**2 + 4.0 * r_ohm * p_w
+            if discriminant < 0.0:
+                # Deeper discharge than the pack can physically supply — clamp at max power
+                self.current_a = -ocv_v / (2.0 * r_ohm)
+            else:
+                self.current_a = (-ocv_v + math.sqrt(discriminant)) / (2.0 * r_ohm)
 
-        # Step 5: Degradation Update
+        self.voltage_v = ocv_v + self.current_a * r_ohm
+        ohmic_loss_kw = (self.current_a**2) * r_ohm / 1000.0
+
+        # Step 5: Thermal Dynamics driven by the true ohmic loss I²·R
+        temp_c = self.thermal.step(actual_power_kw, dt_seconds, heat_kw=ohmic_loss_kw)
+
+        # Step 6: Degradation Update (cycle ageing + temperature-accelerated calendar ageing)
         # Energy throughput across battery terminals: |P| * dt
         energy_throughput_step = abs(actual_power_kw) * dt_hours
-        self.capacity_actual_kwh, soh_pct = self.degradation.step(energy_throughput_step)
-
-        # Step 6: Voltage & Current calculation
-        self.voltage_v = self._calculate_ocv(self.soc_pct)
-        if self.voltage_v > 0.0:
-            # I = (P * 1000) / V (sign preserved: I > 0 charge, I < 0 discharge)
-            self.current_a = (actual_power_kw * 1000.0) / self.voltage_v
-        else:
-            self.current_a = 0.0
+        self.capacity_actual_kwh, soh_pct = self.degradation.step(
+            energy_throughput_step, dt_seconds=dt_seconds, temp_c=temp_c
+        )
+        # Capacity fade must not leave stored energy above the (now smaller) pack limit
+        if self.soe_kwh > self.capacity_actual_kwh:
+            self.soe_kwh = self.capacity_actual_kwh
+        self.soc_pct = (
+            (self.soe_kwh / self.capacity_actual_kwh) * 100.0
+            if self.capacity_actual_kwh > 0
+            else 0.0
+        )
 
         # Step 7: Check Protective Alarms & Update FSM
         self.bms.check_protections(
@@ -234,7 +271,62 @@ class Battery:
             available_charge_kw=avail_ch,
             available_discharge_kw=avail_dis,
             alarms=list(self.bms.alarms),
+            aux_kw=aux_kw,
+            heat_kw=ohmic_loss_kw,
+            capacity_actual_kwh=self.capacity_actual_kwh,
         )
+
+    def apply_config(self, updates: dict[str, Any]) -> list[str]:
+        """Apply a live configuration update pushed by the EMS.
+
+        Returns the list of field names that were actually changed. Physical
+        state (SoE, temperature, accumulated degradation) is preserved; SoC is
+        recomputed against the new capacity so energy — not percentage — is the
+        conserved quantity, which is what happens when a real pack is re-rated.
+        """
+        known = set(type(self.config).model_fields.keys())
+        clean = {k: v for k, v in updates.items() if k in known and v is not None}
+        if not clean:
+            return []
+
+        data = self.config.model_dump()
+        changed = [k for k, v in clean.items() if data.get(k) != v]
+        if not changed:
+            return []
+        data.update(clean)
+        # Re-derive thermal/electrical coefficients unless explicitly overridden
+        for key in ("r_internal", "k_cooling", "c_thermal", "r_pack_ohm"):
+            if key not in clean:
+                data[key] = None
+
+        old_capacity = self.config.capacity_kwh
+        self.config = type(self.config)(**data)
+
+        # Propagate to sub-models
+        self.bms.config = self.config
+        self.pcs.power_max_kw = self.config.power_max_kw
+        self.pcs.ramp_rate_kw_s = self.config.ramp_rate_kw_s
+        self.thermal.temp_ambient_c = self.config.temp_ambient_c
+        self.thermal.r_internal = self.config.r_internal or self.thermal.r_internal
+        self.thermal.k_cooling = self.config.k_cooling or self.thermal.k_cooling
+        self.thermal.c_thermal = self.config.c_thermal or self.thermal.c_thermal
+        self.degradation.cycle_life = self.config.cycle_life
+        self.degradation.calendar_fade_pct_per_year = self.config.calendar_fade_pct_per_year
+        self.degradation.temp_ref_c = self.config.deg_temp_ref_c
+        self.degradation.temp_doubling_k = self.config.deg_temp_doubling_k
+
+        if self.config.capacity_kwh != old_capacity:
+            self.degradation.rescale_nominal(self.config.capacity_kwh)
+            self.capacity_actual_kwh = self.degradation.capacity_actual_kwh
+            self.soe_kwh = min(self.soe_kwh, self.capacity_actual_kwh)
+            self.soc_pct = (
+                (self.soe_kwh / self.capacity_actual_kwh) * 100.0
+                if self.capacity_actual_kwh > 0
+                else 0.0
+            )
+
+        logger.info("Applied live config update from EMS: %s", changed)
+        return changed
 
     def handle_command(self, cmd: str) -> bool:
         """Handle control commands from EMS."""

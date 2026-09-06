@@ -17,6 +17,7 @@ processes that communicate strictly via MQTT (Mosquitto broker, port 1883).
 | `sim/clock` | EMS → All | Each simulation tick | 0 | No | Broadcast of unified simulation time |
 | `ems/{id}/setpoint` | EMS → BESS | On schedule change / dispatch | 1 | No | Active power setpoint command |
 | `ems/{id}/command` | EMS → BESS | On supervisory event / test | 1 | No | Operational commands & fault injection |
+| `ems/{id}/config` | EMS → BESS | On startup and on every save of the battery settings section | 1 | Yes | Physical battery parameters (capacity, power, SoC limits, efficiencies, thermal design, degradation). Retained so the simulator picks up operator settings regardless of service start order. |
 | `bess/{id}/telemetry` | BESS → EMS | Each simulation tick (1 min default) | 0 | No | Complete electrical & thermal state |
 | `bess/{id}/status` | BESS → EMS | On state transition / periodic | 1 | Yes | FSM operational state |
 | `bess/{id}/alarm` | BESS → EMS | On protective trip event | 1 | No | Safety & threshold violation alarms |

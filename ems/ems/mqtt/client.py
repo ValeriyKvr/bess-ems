@@ -142,6 +142,16 @@ class EmsMqttClient:
         topic = f"ems/{bess_id}/setpoint"
         self.client.publish(topic, json.dumps(setpoint_data), qos=1)
 
+    def publish_config(self, bess_id: str, battery_params: dict[str, Any]) -> None:
+        """Publish battery parameters to ems/{id}/config as a retained message.
+
+        Retained so the simulator receives the operator's parameters on connect,
+        regardless of which service starts first.
+        """
+        topic = f"ems/{bess_id}/config"
+        self.client.publish(topic, json.dumps(battery_params), qos=1, retain=True)
+        logger.info("Published BESS configuration to %s (%d fields)", topic, len(battery_params))
+
     def publish_command(self, bess_id: str, cmd_data: dict[str, Any] | str) -> None:
         """Publish control command to ems/{id}/command."""
         topic = f"ems/{bess_id}/command"
