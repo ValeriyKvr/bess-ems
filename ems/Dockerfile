@@ -14,6 +14,11 @@ COPY pyproject.toml README.md alembic.ini ./
 # Install dependencies into system Python
 RUN uv pip install --system --no-cache -r pyproject.toml
 
+# Install runtime libraries (libgomp1 required for LightGBM OpenMP)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy source code
 COPY ems/ ems/
 
