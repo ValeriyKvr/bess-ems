@@ -17,6 +17,7 @@ interface TelemetryState {
   pauseSim: () => Promise<void>;
   resumeSim: (speed?: number) => Promise<void>;
   stepSim: (seconds?: number) => Promise<void>;
+  seekTime: (hour: number, minute?: number) => Promise<void>;
   fetchLatestSchedule: () => Promise<void>;
   fetchRecentEvents: () => Promise<void>;
 }
@@ -173,6 +174,18 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => ({
       });
     } catch (err) {
       console.error('Failed to step:', err);
+    }
+  },
+
+  seekTime: async (hour: number, minute = 0) => {
+    try {
+      await fetch('/api/sim/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'seek', hour, minute }),
+      });
+    } catch (err) {
+      console.error('Failed to seek time:', err);
     }
   },
 

@@ -364,6 +364,25 @@ async def control_sim(payload: dict[str, Any]):
             sim_state["speed"] = int(payload["speed"])
     elif action == "step":
         sim_state["step_count"] += 1
+    elif action in ("seek", "jump"):
+        if "jump_to" in payload and payload["jump_to"]:
+            target_t = datetime.fromisoformat(payload["jump_to"].replace("Z", "+00:00"))
+        else:
+            hour = int(payload.get("hour", 0))
+            minute = int(payload.get("minute", 0))
+            target_t = sim_state["start_sim_time"].replace(hour=hour, minute=minute, second=0)
+        sim_state["start_sim_time"] = target_t
+        sim_state["step_count"] = 0
+        tick = make_tick(target_t)
+        dead_conns = []
+        for ws in active_connections:
+            try:
+                await ws.send_json(tick)
+            except Exception:
+                dead_conns.append(ws)
+        for dead in dead_conns:
+            if dead in active_connections:
+                active_connections.remove(dead)
     return {"status": "ok", "state": sim_state}
 
 
