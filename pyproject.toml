@@ -1,0 +1,17 @@
+[project]
+name = "bess-ems-simulator"
+version = "0.1.0"
+description = "BESS <-> EMS Simulator on Ukrainian Electricity Market"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ems", "bess_sim"]
