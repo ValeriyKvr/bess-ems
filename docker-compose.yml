@@ -19,13 +19,14 @@ services:
       start_period: 5s
 
   mosquitto:
-    image: eclipse-mosquitto:2
+    build:
+      context: ./mosquitto
+      dockerfile: Dockerfile
     container_name: bess-mosquitto
     restart: unless-stopped
     ports:
       - "1883:1883"
     volumes:
-      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - mosquitto_data:/mosquitto/data
     healthcheck:
       test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/broker/version' -C 1 -W 2 || exit 1"]
