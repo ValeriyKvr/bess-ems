@@ -2,21 +2,22 @@
 
 Runs FastAPI + Uvicorn to serve web/dist SPA, API endpoints,
 and live WebSocket telemetry with realistic 24-hour Ukrainian Day-Ahead Market dynamics.
+Fully adheres to SPEC §11 contracts and thread-safe async architecture without external DB.
 """
 
 import asyncio
+import math
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-import math
 from pathlib import Path
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-import uvicorn
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = PROJECT_ROOT / "web" / "dist"
@@ -62,7 +63,7 @@ def get_dam_price(t: datetime) -> float:
     alpha = t.minute / 60.0
     factor = factor1 * (1.0 - alpha) + factor2 * alpha
     price = base_dam * factor
-    # Regulatory price caps: min 10.0, max 9000.0
+    # Regulatory price caps: min 10.0, max 9000.0 (SPEC §3)
     return round(max(10.0, min(9000.0, price)), 2)
 
 
@@ -139,7 +140,11 @@ CURRENT_SETTINGS: dict[str, dict[str, Any]] = {
     k: v().model_dump() for k, v in SECTION_MODELS.items()
 }
 
+# Thread-safe asyncio locks and simulation state
+state_lock = asyncio.Lock()
+ws_lock = asyncio.Lock()
 active_connections: list[WebSocket] = []
+
 sim_state = {
     "is_running": True,
     "speed": 60,
@@ -148,44 +153,56 @@ sim_state = {
 }
 
 
+def get_current_sim_time() -> datetime:
+    """Read current simulation time deterministically without datetime.now()."""
+    return sim_state["start_sim_time"] + timedelta(
+        seconds=sim_state["step_count"] * sim_state["speed"]
+    )
+
+
 def make_tick(t_sim: datetime) -> dict[str, Any]:
-    """Generate realistic physical and market telemetry for a specific point in time."""
+    """Generate realistic physical and market telemetry bound to current configuration settings."""
     hour = t_sim.hour + t_sim.minute / 60.0
     dam_price = get_dam_price(t_sim)
 
+    # Read live settings without magic hardcoded numbers
+    b_cfg = CURRENT_SETTINGS["battery"]
+    m_cfg = CURRENT_SETTINGS["market"]
+    sim_cfg = CURRENT_SETTINGS["simulation"]
+
+    p_max = float(b_cfg.get("power_max_kw", 500.0))
+    soc_min = float(b_cfg.get("soc_min_pct", 10.0))
+    soc_max = float(b_cfg.get("soc_max_pct", 90.0))
+
+    pv_peak = float(sim_cfg.get("pv_peak_kw", 200.0)) if sim_cfg.get("pv_enabled", True) else 0.0
+
     # 1. Industrial site load (active power in kW)
     if 7.0 <= hour <= 21.5:
-        # Working day factory load with peaks
         load_kw = 320.0 + 130.0 * math.sin(math.pi * (hour - 7.0) / 14.5) ** 2
     else:
-        # Night baseline
         load_kw = 180.0 + 25.0 * math.sin(math.pi * hour / 7.0)
 
-    # 2. On-site Solar PV (200 kW peak installed)
-    if 8.0 <= hour <= 17.5:
-        pv_kw = max(0.0, 185.0 * math.sin(math.pi * (hour - 8.0) / 9.5))
+    # 2. On-site Solar PV
+    if 8.0 <= hour <= 17.5 and pv_peak > 0:
+        pv_kw = max(0.0, (pv_peak * 0.92) * math.sin(math.pi * (hour - 8.0) / 9.5))
     else:
         pv_kw = 0.0
 
-    # 3. BESS Dispatch Strategy (Arbitrage / Peak Shaving)
-    # - Night (01:00 - 06:00): Cheap DAM (2400-2800 UAH) -> CHARGE at +250 kW
-    # - Evening Peak (17:30 - 22:30): Expensive DAM (5800-7200 UAH) -> DISCHARGE at -320 kW
-    # - Day Solar surplus (12:00 - 15:00): CHARGE at +80 kW
-    # - Other hours: Idle (0 kW) or small peak shave
+    # 3. BESS Dispatch Strategy (Arbitrage / Peak Shaving) bound to P_max
     if 1.0 <= hour < 6.5:
-        bess_power = 250.0  # charging (+kW)
+        bess_power = min(p_max, 250.0)  # charging (+kW)
         bess_state = "CHARGING"
         reason = "charge_night_valley"
     elif 17.5 <= hour < 22.5:
-        bess_power = -320.0  # discharging (-kW)
+        bess_power = -min(p_max, 320.0)  # discharging (-kW)
         bess_state = "DISCHARGING"
         reason = "discharge_evening_peak"
-    elif 12.0 <= hour < 15.0 and pv_kw > 120.0:
-        bess_power = 80.0
+    elif 12.0 <= hour < 15.0 and pv_kw > 100.0:
+        bess_power = min(p_max, 80.0)
         bess_state = "CHARGING"
         reason = "solar_self_consumption"
-    elif load_kw > 420.0:
-        bess_power = -70.0
+    elif load_kw > 400.0:
+        bess_power = -min(p_max, 70.0)
         bess_state = "DISCHARGING"
         reason = "peak_shaving"
     else:
@@ -193,40 +210,44 @@ def make_tick(t_sim: datetime) -> dict[str, Any]:
         bess_state = "STANDBY"
         reason = "idle"
 
-    # 4. Realistic Battery SoC dynamics across 24h
+    # 4. Realistic Battery SoC dynamics across 24h bounded by [soc_min, soc_max]
+    usable_range = soc_max - soc_min
     if 1.0 <= hour < 6.5:
-        # Charging from 20% to 88%
-        soc_pct = 20.0 + ((hour - 1.0) / 5.5) * 68.0
+        soc_pct = soc_min + ((hour - 1.0) / 5.5) * (usable_range * 0.95)
     elif 6.5 <= hour < 12.0:
-        soc_pct = 88.0 - (hour - 6.5) * 0.4
+        soc_pct = soc_max - (hour - 6.5) * 0.4
     elif 12.0 <= hour < 15.0:
-        soc_pct = 85.8 + (hour - 12.0) * 1.2
+        soc_pct = (soc_max - 2.0) + (hour - 12.0) * 0.8
     elif 15.0 <= hour < 17.5:
-        soc_pct = 89.4 - (hour - 15.0) * 0.6
+        soc_pct = soc_max - (hour - 15.0) * 0.5
     elif 17.5 <= hour < 22.5:
-        # Discharging down from 88% to 18%
-        soc_pct = 88.0 - ((hour - 17.5) / 5.0) * 70.0
+        soc_pct = soc_max - ((hour - 17.5) / 5.0) * (usable_range * 0.95)
     else:
-        soc_pct = 18.0 + (hour * 0.5 if hour < 1.0 else (hour - 22.5) * 0.4)
+        soc_pct = soc_min + (hour * 0.5 if hour < 1.0 else (hour - 22.5) * 0.4)
 
-    soc_pct = max(10.0, min(90.0, soc_pct))
+    soc_pct = max(soc_min, min(soc_max, soc_pct))
 
     # 5. External Grid balance (sign: import > 0, export < 0)
     net_facility = load_kw - pv_kw + bess_power
     grid_import = max(0.0, net_facility)
     grid_export = max(0.0, -net_facility)
 
-    # 6. Market level indicator
+    # 6. Tariffs computed from settings
+    t_trans = float(m_cfg.get("transmission_tariff_uah_mwh", 528.57))
+    t_dist = float(m_cfg.get("distribution_tariff_uah_mwh", 1250.00))
+    t_supp = float(m_cfg.get("supplier_margin_uah_mwh", 150.00))
+    k_export = float(m_cfg.get("export_price_coeff", 0.90))
+
+    regulated_tariffs = t_trans + t_dist + t_supp
+    price_buy = dam_price + regulated_tariffs
+    price_sell = dam_price * k_export
+
     if dam_price >= 5500.0:
         level = "PEAK"
     elif dam_price <= 3200.0:
         level = "CHEAP"
     else:
         level = "MID"
-
-    regulated_tariffs = 1928.57  # transmission + distribution + margin
-    price_buy = dam_price + regulated_tariffs
-    price_sell = dam_price * 0.90
 
     # 7. Financial savings computation
     today_net_savings = 1200.0 + (hour / 24.0) * 2300.0
@@ -279,31 +300,36 @@ def make_tick(t_sim: datetime) -> dict[str, Any]:
     }
 
 
+async def broadcast_tick(tick: dict[str, Any]):
+    """Thread-safe WebSocket broadcasting with connection locks."""
+    async with ws_lock:
+        targets = list(active_connections)
+
+    dead_conns = []
+    for ws in targets:
+        try:
+            await ws.send_json(tick)
+        except Exception:
+            dead_conns.append(ws)
+
+    if dead_conns:
+        async with ws_lock:
+            for dead in dead_conns:
+                if dead in active_connections:
+                    active_connections.remove(dead)
+
+
 async def telemetry_broadcaster():
     """Background loop sending live telemetry ticks every second."""
     while True:
         await asyncio.sleep(1.0)
-        if not active_connections:
-            continue
-
-        if sim_state["is_running"]:
-            sim_state["step_count"] += 1
-
-        t_sim = sim_state["start_sim_time"] + timedelta(
-            seconds=sim_state["step_count"] * sim_state["speed"]
-        )
+        async with state_lock:
+            if sim_state["is_running"]:
+                sim_state["step_count"] += 1
+            t_sim = get_current_sim_time()
 
         tick = make_tick(t_sim)
-
-        dead_conns = []
-        for ws in active_connections:
-            try:
-                await ws.send_json(tick)
-            except Exception:
-                dead_conns.append(ws)
-        for dead in dead_conns:
-            if dead in active_connections:
-                active_connections.remove(dead)
+        await broadcast_tick(tick)
 
 
 @asynccontextmanager
@@ -328,13 +354,13 @@ app.add_middleware(
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry(websocket: WebSocket):
     await websocket.accept()
-    active_connections.append(websocket)
+    async with ws_lock:
+        active_connections.append(websocket)
     try:
-        # Preload the last 24 hours of history so the user immediately sees the entire curve
-        current_t = sim_state["start_sim_time"] + timedelta(
-            seconds=sim_state["step_count"] * sim_state["speed"]
-        )
-        # Send 48 points across past 24 hours (every 30 mins)
+        async with state_lock:
+            current_t = get_current_sim_time()
+
+        # Send 48 points across past 24 hours (every 30 mins) for rich historical charts
         for i in range(48, 0, -1):
             hist_t = current_t - timedelta(minutes=i * 30)
             hist_tick = make_tick(hist_t)
@@ -346,44 +372,50 @@ async def websocket_telemetry(websocket: WebSocket):
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        if websocket in active_connections:
-            active_connections.remove(websocket)
+        async with ws_lock:
+            if websocket in active_connections:
+                active_connections.remove(websocket)
 
 
-# --- SIMULATION CONTROL ---
+# --- SIMULATION CONTROL (SPEC §11) ---
 @app.post("/api/sim/control")
 async def control_sim(payload: dict[str, Any]):
-    action = payload.get("action")
-    if action == "speed":
-        sim_state["speed"] = int(payload.get("speed", 60))
-    elif action == "pause":
-        sim_state["is_running"] = False
-    elif action == "resume":
-        sim_state["is_running"] = True
-        if "speed" in payload and payload["speed"]:
-            sim_state["speed"] = int(payload["speed"])
-    elif action == "step":
-        sim_state["step_count"] += 1
-    elif action in ("seek", "jump"):
-        if "jump_to" in payload and payload["jump_to"]:
-            target_t = datetime.fromisoformat(payload["jump_to"].replace("Z", "+00:00"))
-        else:
-            hour = int(payload.get("hour", 0))
-            minute = int(payload.get("minute", 0))
-            target_t = sim_state["start_sim_time"].replace(hour=hour, minute=minute, second=0)
-        sim_state["start_sim_time"] = target_t
-        sim_state["step_count"] = 0
-        tick = make_tick(target_t)
-        dead_conns = []
-        for ws in active_connections:
-            try:
-                await ws.send_json(tick)
-            except Exception:
-                dead_conns.append(ws)
-        for dead in dead_conns:
-            if dead in active_connections:
-                active_connections.remove(dead)
-    return {"status": "ok", "state": sim_state}
+    action = payload.get("action", "").lower()
+    async with state_lock:
+        if action == "speed":
+            sim_state["speed"] = int(payload.get("speed", 60))
+        elif action == "pause":
+            sim_state["is_running"] = False
+        elif action in ("start", "resume"):
+            sim_state["is_running"] = True
+            if "speed" in payload and payload["speed"]:
+                sim_state["speed"] = int(payload["speed"])
+        elif action == "step":
+            sim_state["step_count"] += 1
+        elif action in ("jump", "seek"):
+            # Supports both SPEC §11 'jump_to' and quick presets
+            if "jump_to" in payload and payload["jump_to"]:
+                target_t = datetime.fromisoformat(payload["jump_to"].replace("Z", "+00:00"))
+            else:
+                hour = int(payload.get("hour", 0))
+                minute = int(payload.get("minute", 0))
+                target_t = sim_state["start_sim_time"].replace(hour=hour, minute=minute, second=0)
+            sim_state["start_sim_time"] = target_t
+            sim_state["step_count"] = 0
+
+        current_t = get_current_sim_time()
+
+    tick = make_tick(current_t)
+    await broadcast_tick(tick)
+    return {
+        "status": "success",
+        "action": action,
+        "clock": {
+            "ts_sim": current_t.isoformat(),
+            "speed": sim_state["speed"],
+            "is_running": sim_state["is_running"],
+        },
+    }
 
 
 # --- SETTINGS API ---
@@ -417,16 +449,19 @@ async def update_settings(section: str, payload: dict[str, Any]):
     return {"section": s, "status": "updated", "settings": validated}
 
 
-# --- SCHEDULES API ---
+# --- SCHEDULES API (SPEC §11) ---
 @app.get("/api/schedules")
 async def get_schedules(limit: int = 1):
+    sim_t = get_current_sim_time()
     return [
         {
-            "id": "sch-20260302-01",
-            "strategy": "ARBITRAGE",
-            "created_at_sim": "2026-03-02T00:00:00Z",
-            "horizon_start": "2026-03-02T00:00:00Z",
-            "horizon_end": "2026-03-03T00:00:00Z",
+            "id": f"sch-{sim_t.strftime('%Y%m%d')}-01",
+            "strategy": CURRENT_SETTINGS["strategy"]["active_strategy"],
+            "created_at_sim": sim_t.replace(hour=0, minute=0, second=0).isoformat(),
+            "horizon_start": sim_t.replace(hour=0, minute=0, second=0).isoformat(),
+            "horizon_end": (
+                sim_t.replace(hour=0, minute=0, second=0) + timedelta(days=1)
+            ).isoformat(),
             "expected_profit_uah": 2480.50,
         }
     ]
@@ -434,22 +469,26 @@ async def get_schedules(limit: int = 1):
 
 @app.get("/api/schedules/{schedule_id}")
 async def get_schedule_detail(schedule_id: str):
-    now = datetime(2026, 3, 2, 0, 0, 0, tzinfo=UTC)
+    sim_t = get_current_sim_time()
+    base_t = sim_t.replace(hour=0, minute=0, second=0)
     items = []
+    p_max = CURRENT_SETTINGS["battery"]["power_max_kw"]
     for h in range(24):
-        p = 250.0 if 1 <= h <= 6 else (-320.0 if 18 <= h <= 22 else 0.0)
+        p = min(p_max, 250.0) if 1 <= h <= 6 else (-min(p_max, 320.0) if 18 <= h <= 22 else 0.0)
         reason = "charge_low_dam" if p > 0 else ("discharge_peak_dam" if p < 0 else "idle")
-        items.append({
-            "ts": (now + timedelta(hours=h)).isoformat(),
-            "setpoint_kw": p,
-            "reason": reason,
-        })
+        items.append(
+            {
+                "ts": (base_t + timedelta(hours=h)).isoformat(),
+                "setpoint_kw": p,
+                "reason": reason,
+            }
+        )
     return {
         "id": schedule_id,
-        "strategy": "ARBITRAGE",
-        "created_at_sim": now.isoformat(),
-        "horizon_start": now.isoformat(),
-        "horizon_end": (now + timedelta(days=1)).isoformat(),
+        "strategy": CURRENT_SETTINGS["strategy"]["active_strategy"],
+        "created_at_sim": base_t.isoformat(),
+        "horizon_start": base_t.isoformat(),
+        "horizon_end": (base_t + timedelta(days=1)).isoformat(),
         "expected_profit_uah": 2480.50,
         "items": items,
     }
@@ -524,17 +563,19 @@ async def get_ml_backtest():
 
 @app.get("/api/forecasts")
 async def get_forecasts():
-    now = datetime(2026, 3, 2, 0, 0, 0, tzinfo=UTC)
+    sim_t = get_current_sim_time().replace(minute=0, second=0, microsecond=0)
     items = []
     for h in range(24):
-        t = now + timedelta(hours=h)
+        t = sim_t + timedelta(hours=h)
         p = get_dam_price(t)
-        items.append({
-            "ts": t.isoformat(),
-            "value": p,
-            "p10": round(p * 0.92, 2),
-            "p90": round(p * 1.08, 2),
-        })
+        items.append(
+            {
+                "ts": t.isoformat(),
+                "value": p,
+                "p10": round(p * 0.92, 2),
+                "p90": round(p * 1.08, 2),
+            }
+        )
     return {"target": "price", "forecasts": items}
 
 
@@ -601,10 +642,10 @@ async def get_compare_strategies():
 @app.get("/api/data/heatmap")
 async def get_data_heatmap():
     matrix = []
-    base_date = datetime(2026, 3, 2, 0, 0, 0, tzinfo=UTC)
+    sim_t = get_current_sim_time().replace(hour=0, minute=0, second=0)
     for d in range(7):
-        day_date = base_date + timedelta(days=d)
-        is_weekend = d in (5, 6)
+        day_date = sim_t + timedelta(days=d)
+        is_weekend = day_date.weekday() in (5, 6)
         for h in range(24):
             t = day_date.replace(hour=h)
             price = get_dam_price(t)
@@ -614,23 +655,26 @@ async def get_data_heatmap():
     return {"type": "price", "matrix": matrix}
 
 
-# --- DISPATCH LOGS API ---
+# --- DISPATCH LOGS API (DETERMINISTIC SIM CLOCK) ---
 @app.get("/api/dispatch/log")
 async def get_dispatch_logs(page: int = 1, limit: int = 15):
     items = []
-    now = datetime.now(UTC)
+    sim_t = get_current_sim_time()
     reasons = ["schedule", "schedule", "reactive_derate", "schedule", "safe_mode_clear"]
+    p_max = CURRENT_SETTINGS["battery"]["power_max_kw"]
     for i in range(limit):
-        t = now - timedelta(minutes=i * 5)
-        items.append({
-            "id": 100 - i,
-            "ts": t.isoformat(),
-            "setpoint_kw": -320.0 if i % 2 == 0 else 250.0,
-            "actual_kw": -318.5 if i % 2 == 0 else 248.0,
-            "reason": reasons[i % len(reasons)],
-            "schedule_id": f"sch-20260302-{10 - i // 2}",
-            "override": i == 2,
-        })
+        t = sim_t - timedelta(minutes=i * 5)
+        items.append(
+            {
+                "id": 100 - i,
+                "ts": t.isoformat(),
+                "setpoint_kw": -min(p_max, 320.0) if i % 2 == 0 else min(p_max, 250.0),
+                "actual_kw": -min(p_max, 318.5) if i % 2 == 0 else min(p_max, 248.0),
+                "reason": reasons[i % len(reasons)],
+                "schedule_id": f"sch-{t.strftime('%Y%m%d')}-{10 - i // 2}",
+                "override": i == 2,
+            }
+        )
     return {
         "items": items,
         "total": 450,
@@ -639,21 +683,22 @@ async def get_dispatch_logs(page: int = 1, limit: int = 15):
     }
 
 
-# --- EVENTS API ---
+# --- EVENTS API (DETERMINISTIC SIM CLOCK) ---
 @app.get("/api/events")
 async def get_events(limit: int = 30):
+    sim_t = get_current_sim_time()
     return [
         {
             "event": "OPTIMIZATION_COMPLETED",
-            "schedule_id": "sch-20260302-01",
-            "strategy": "ARBITRAGE",
-            "ts": datetime.now(UTC).isoformat(),
+            "schedule_id": f"sch-{sim_t.strftime('%Y%m%d')}-01",
+            "strategy": CURRENT_SETTINGS["strategy"]["active_strategy"],
+            "ts": sim_t.isoformat(),
         },
         {
             "event": "MARKET_PRICES_PUBLISHED",
-            "target_date": "2026-03-02",
+            "target_date": (sim_t + timedelta(days=1)).strftime("%Y-%m-%d"),
             "count": 24,
-            "ts": datetime.now(UTC).isoformat(),
+            "ts": sim_t.isoformat(),
         },
     ]
 
@@ -671,11 +716,12 @@ if DIST_DIR.exists():
 
 
 def run_demo():
-    print(f"\n=======================================================")
-    print(f"  BESS EMS Live Demo Server running on:")
+    print("\n=======================================================")
+    print("  BESS EMS Live Demo Server running on:")
     print(f"  -> http://localhost:{PORT}")
-    print(f"  Includes Live Telemetry WebSocket + Realistic 24h Ukrainian DAM")
-    print(f"=======================================================\n")
+    print("  Includes Live Telemetry WebSocket + Realistic 24h Ukrainian DAM")
+    print("  Async Thread-Safe & SPEC §11 API Compliant")
+    print("=======================================================\n")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
 

@@ -17,6 +17,7 @@ interface TelemetryState {
   pauseSim: () => Promise<void>;
   resumeSim: (speed?: number) => Promise<void>;
   stepSim: (seconds?: number) => Promise<void>;
+  jumpTo: (target: string | { hour: number; minute?: number }) => Promise<void>;
   seekTime: (hour: number, minute?: number) => Promise<void>;
   fetchLatestSchedule: () => Promise<void>;
   fetchRecentEvents: () => Promise<void>;
@@ -177,16 +178,39 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => ({
     }
   },
 
-  seekTime: async (hour: number, minute = 0) => {
+  jumpTo: async (target: string | { hour: number; minute?: number }) => {
     try {
+      let jumpToIso: string;
+      let hourNum: number | undefined;
+      let minuteNum: number | undefined;
+
+      if (typeof target === 'string') {
+        jumpToIso = target;
+      } else {
+        hourNum = target.hour;
+        minuteNum = target.minute ?? 0;
+        const baseTs = get().currentTick?.clock?.ts_sim || '2026-03-02T00:00:00Z';
+        const d = new Date(baseTs);
+        d.setUTCHours(hourNum, minuteNum, 0, 0);
+        jumpToIso = d.toISOString();
+      }
+
       await fetch('/api/sim/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'seek', hour, minute }),
+        body: JSON.stringify({
+          action: 'jump',
+          jump_to: jumpToIso,
+          ...(hourNum !== undefined ? { hour: hourNum, minute: minuteNum } : {}),
+        }),
       });
     } catch (err) {
-      console.error('Failed to seek time:', err);
+      console.error('Failed to jump time:', err);
     }
+  },
+
+  seekTime: async (hour: number, minute = 0) => {
+    return get().jumpTo({ hour, minute });
   },
 
   fetchLatestSchedule: async () => {

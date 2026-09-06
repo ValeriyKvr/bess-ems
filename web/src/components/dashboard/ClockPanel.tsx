@@ -1,8 +1,9 @@
+import { useState, useRef, useEffect } from 'react';
 import { Clock, Play, Pause, StepForward, TrendingUp, TrendingDown, Sun, Moon, Zap, Activity } from 'lucide-react';
 import { useTelemetryStore } from '../../stores/telemetryStore';
 
 export function ClockPanel() {
-  const { currentTick, setSpeed, pauseSim, resumeSim, stepSim, seekTime } = useTelemetryStore();
+  const { currentTick, setSpeed, pauseSim, resumeSim, stepSim, jumpTo } = useTelemetryStore();
 
   const clock = currentTick?.clock;
   const isPaused = clock?.is_paused ?? false;
@@ -12,7 +13,7 @@ export function ClockPanel() {
   // Format UTC date & time
   let formattedDate = '02.03.2026';
   let formattedTime = '08:15:00';
-  let currentMinutes = 8 * 60 + 15;
+  let serverMinutes = 8 * 60 + 15;
 
   try {
     const d = new Date(rawSimTime);
@@ -29,26 +30,40 @@ export function ClockPanel() {
         minute: '2-digit',
         second: '2-digit',
       });
-      currentMinutes = d.getUTCHours() * 60 + d.getUTCMinutes();
+      serverMinutes = d.getUTCHours() * 60 + d.getUTCMinutes();
     }
   } catch {
     // fallback
   }
 
-  // Market tariffs
+  // Smooth dragging with throttling
+  const [dragMinutes, setDragMinutes] = useState<number | null>(null);
+  const throttleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (throttleTimerRef.current) {
+        clearTimeout(throttleTimerRef.current);
+      }
+    };
+  }, []);
+
+  const displayMinutes = dragMinutes !== null ? dragMinutes : serverMinutes;
+
+  // Market tariffs from telemetry (no magic hardcoded constants)
   const market = currentTick?.market;
-  const priceDam = market?.price_dam ?? 4500;
-  const priceBuy = market?.price_buy ?? (priceDam + 1928.57);
-  const priceSell = market?.price_sell ?? (priceDam * 0.9);
+  const priceDam = market?.price_dam ?? 4200;
+  const priceBuy = market?.price_buy ?? priceDam;
+  const priceSell = market?.price_sell ?? priceDam;
 
   // Price level badge
   let priceBadgeText = 'СЕРЕДНЬО';
   let priceBadgeClass = 'bg-amber-950 text-amber-300 border-amber-800';
 
-  if (priceDam < 3200) {
+  if (market?.level === 'CHEAP' || priceDam < 3200) {
     priceBadgeText = 'ДЕШЕВО';
     priceBadgeClass = 'bg-emerald-950 text-emerald-300 border-emerald-800';
-  } else if (priceDam >= 5500) {
+  } else if (market?.level === 'PEAK' || priceDam >= 5500) {
     priceBadgeText = 'ПІК';
     priceBadgeClass = 'bg-rose-950 text-rose-300 border-rose-800 animate-pulse';
   }
@@ -57,9 +72,26 @@ export function ClockPanel() {
 
   const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseInt(e.target.value, 10);
-    const h = Math.floor(val / 60);
-    const m = val % 60;
-    seekTime(h, m);
+    setDragMinutes(val);
+
+    // Throttle API jump calls by 120ms to prevent network flooding while scrubbing
+    if (throttleTimerRef.current) {
+      clearTimeout(throttleTimerRef.current);
+    }
+    throttleTimerRef.current = setTimeout(() => {
+      const h = Math.floor(val / 60);
+      const m = val % 60;
+      jumpTo({ hour: h, minute: m });
+      setDragMinutes(null);
+    }, 120);
+  };
+
+  const handlePresetClick = (hour: number, minute: number) => {
+    if (throttleTimerRef.current) {
+      clearTimeout(throttleTimerRef.current);
+    }
+    setDragMinutes(null);
+    jumpTo({ hour, minute });
   };
 
   const presets = [
@@ -178,8 +210,8 @@ export function ClockPanel() {
           <div className="flex items-center gap-2">
             <span className="font-semibold text-slate-300">Швидка навігація по добі:</span>
             <span className="font-mono text-blue-400 bg-blue-950/60 px-2 py-0.5 rounded border border-blue-800/60">
-              {Math.floor(currentMinutes / 60).toString().padStart(2, '0')}:
-              {(currentMinutes % 60).toString().padStart(2, '0')} UTC
+              {Math.floor(displayMinutes / 60).toString().padStart(2, '0')}:
+              {(displayMinutes % 60).toString().padStart(2, '0')} UTC
             </span>
           </div>
           <div className="hidden sm:flex items-center gap-1.5">
@@ -188,7 +220,7 @@ export function ClockPanel() {
               return (
                 <button
                   key={p.label}
-                  onClick={() => seekTime(p.hour, p.minute)}
+                  onClick={() => handlePresetClick(p.hour, p.minute)}
                   className={`px-2 py-1 rounded-lg text-[11px] font-medium bg-slate-950/80 border border-slate-800 transition-all flex items-center gap-1 ${p.color}`}
                 >
                   <Icon className="w-3 h-3" />
@@ -206,7 +238,7 @@ export function ClockPanel() {
             min={0}
             max={1439}
             step={5}
-            value={currentMinutes}
+            value={displayMinutes}
             onChange={handleSliderChange}
             className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500 focus:outline-none transition-all"
             style={{
