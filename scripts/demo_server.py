@@ -562,10 +562,10 @@ async def get_ml_backtest():
 
 
 @app.get("/api/forecasts")
-async def get_forecasts():
+async def get_forecasts(target: str = "price", limit: int = 48):
     sim_t = get_current_sim_time().replace(minute=0, second=0, microsecond=0)
     items = []
-    for h in range(24):
+    for h in range(limit):
         t = sim_t + timedelta(hours=h)
         p = get_dam_price(t)
         items.append(
@@ -574,9 +574,42 @@ async def get_forecasts():
                 "value": p,
                 "p10": round(p * 0.92, 2),
                 "p90": round(p * 1.08, 2),
+                "model_name": "LightGBM 24h Direct",
+                "target": target,
             }
         )
-    return {"target": "price", "forecasts": items}
+    return items
+
+
+# --- DATA TIME SERIES API ---
+@app.get("/api/data/series")
+async def get_data_series(type: str = "price", step: str = "1h"):
+    sim_t = get_current_sim_time().replace(minute=0, second=0, microsecond=0)
+    points = []
+    start_t = sim_t - timedelta(days=7)
+    for h in range(168):
+        t = start_t + timedelta(hours=h)
+        if type == "price":
+            val = get_dam_price(t)
+        elif type == "load":
+            hour = t.hour + t.minute / 60.0
+            val = round(
+                320.0 + 130.0 * math.sin(math.pi * (hour - 7.0) / 14.5) ** 2
+                if 7 <= hour <= 21
+                else 180.0,
+                1,
+            )
+        else:
+            hour = t.hour + t.minute / 60.0
+            val = round(
+                max(0.0, 180.0 * math.sin(math.pi * (hour - 8.0) / 9.5))
+                if 8 <= hour <= 17.5
+                else 0.0,
+                1,
+            )
+        points.append({"ts": t.isoformat(), "value": val})
+    unit = "грн/МВт·год" if type == "price" else "кВт"
+    return {"type": type, "unit": unit, "data": points}
 
 
 # --- REPORTS API ---
