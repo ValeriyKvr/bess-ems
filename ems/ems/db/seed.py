@@ -4,15 +4,17 @@ Guarantees turnkey zero-touch startup: creates tables if they do not exist
 and seeds default configuration and 2 years of synthetic energy market data.
 """
 
+import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ems.api.settings import SECTION_MODELS
-from ems.db.models import Base, DamPrice, Setting, SiteLoad
+from ems.db.models import Base, DamPrice, MlModel, Setting, SiteLoad
 from ems.db.session import engine
 from ems.ingestion.generator import SyntheticDataGenerator
 
@@ -82,8 +84,52 @@ async def seed_database_if_empty(session: AsyncSession, seed: int = 42) -> bool:
     return True
 
 
+async def seed_ml_models_if_empty(session: AsyncSession) -> None:
+    """Scan models directory and register trained baseline models in ml_models table."""
+    models_root = Path(__file__).resolve().parent.parent.parent / "models"
+    if not models_root.exists():
+        return
+
+    for meta_file in models_root.glob("*/*/*/metadata.json"):
+        try:
+            with open(meta_file, encoding="utf-8") as f:
+                meta = json.load(f)
+            name = meta.get("name")
+            version = meta.get("version")
+            target = meta.get("target")
+            metrics = meta.get("metrics")
+            if not (name and version and target):
+                continue
+
+            artifact_dir = meta_file.parent
+            trained_at_str = meta.get("trained_at")
+            trained_at = (
+                datetime.fromisoformat(trained_at_str) if trained_at_str else datetime.now(UTC)
+            )
+
+            stmt = (
+                insert(MlModel)
+                .values(
+                    name=name,
+                    version=version,
+                    target=target,
+                    trained_at=trained_at,
+                    metrics=metrics,
+                    artifact_path=str(artifact_dir),
+                    is_active=(name == "lightgbm"),
+                )
+                .on_conflict_do_nothing(index_elements=["name", "version"])
+            )
+            await session.execute(stmt)
+            logger.info("Discovered and registered ML model %s:%s for %s", name, version, target)
+        except Exception as e:
+            logger.warning("Failed to auto-register ML model from %s: %s", meta_file, e)
+
+    await session.commit()
+
+
 async def ensure_db_initialized_and_seeded(session: AsyncSession, seed: int = 42) -> bool:
-    """Create all tables if not exist and seed default settings & synthetic data."""
+    """Create all tables if not exist and seed default settings, models & synthetic data."""
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -91,4 +137,6 @@ async def ensure_db_initialized_and_seeded(session: AsyncSession, seed: int = 42
     except Exception as e:
         logger.warning("Schema creation warning (may already exist): %s", e)
 
-    return await seed_database_if_empty(session, seed=seed)
+    seeded = await seed_database_if_empty(session, seed=seed)
+    await seed_ml_models_if_empty(session)
+    return seeded

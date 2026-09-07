@@ -28,13 +28,20 @@ def simulate_schedule_financials(
     true_pvs: list[float],
     tariffs: MarketTariffs,
     c_deg: float = 1.25,
-) -> float:
+    capacity_kwh: float = 1000.0,
+) -> dict[str, float]:
     """Evaluate financial performance of planned schedule executed against TRUE actual market prices."""
     total_net = 0.0
+    total_rev = 0.0
+    total_cost = 0.0
+    total_deg = 0.0
+    total_dis = 0.0
+
     for t in range(len(timestamps)):
         sp = schedule_setpoints[t]
         ch = max(0.0, sp)
         dis = max(0.0, -sp)
+        total_dis += dis
 
         p_buy = calculate_buy_price(true_dam_prices[t], tariffs)
         p_sell = calculate_sell_price(true_dam_prices[t], tariffs)
@@ -50,8 +57,19 @@ def simulate_schedule_financials(
             c_deg_uah_kwh=c_deg,
         )
         total_net += fin.net_uah
+        total_rev += fin.export_revenue_uah
+        total_cost += fin.cost_actual_uah
+        total_deg += fin.degradation_uah
 
-    return round(total_net, 2)
+    cycles = (total_dis / capacity_kwh) if capacity_kwh > 0 else 0.0
+
+    return {
+        "net_uah": round(total_net, 2),
+        "revenue_uah": round(total_rev, 2),
+        "cost_uah": round(total_cost, 2),
+        "degradation_uah": round(total_deg, 2),
+        "cycles": round(cycles, 2),
+    }
 
 
 async def run_economic_backtest(
@@ -168,35 +186,39 @@ async def run_economic_backtest(
         perfect_setpoints.extend([it.setpoint_kw for it in sch_perf.items])
 
     # 3. Evaluate Realized Profit for all 3 approaches against true actuals
-    net_naive = simulate_schedule_financials(
+    res_naive = simulate_schedule_financials(
         naive_setpoints, test_timestamps, test_true_prices, test_loads, test_pvs, tariffs
     )
-    net_lgb = simulate_schedule_financials(
+    res_lgb = simulate_schedule_financials(
         lgb_setpoints, test_timestamps, test_true_prices, test_loads, test_pvs, tariffs
     )
-    net_perfect = simulate_schedule_financials(
+    res_perf = simulate_schedule_financials(
         perfect_setpoints, test_timestamps, test_true_prices, test_loads, test_pvs, tariffs
     )
 
+    net_perf = res_perf["net_uah"]
+
+    def _build_item(name: str, ver: str, r: dict[str, float], desc: str) -> dict[str, Any]:
+        pct = round((r["net_uah"] / net_perf * 100.0) if net_perf > 0 else 0.0, 1)
+        return {
+            "model": name,
+            "version": ver,
+            "net_uah": r["net_uah"],
+            "revenue_uah": r["revenue_uah"],
+            "cost_uah": r["cost_uah"],
+            "degradation_uah": r["degradation_uah"],
+            "cycles": r["cycles"],
+            "pct_of_perfect_foresight": pct,
+            "pct_of_ideal": pct,
+            "description": desc,
+        }
+
     results = [
-        {
-            "model": "Naive (Вчора)",
-            "net_uah": net_naive,
-            "pct_of_ideal": round((net_naive / net_perfect * 100.0) if net_perfect > 0 else 0, 1),
-            "description": "Baseline персистенція",
-        },
-        {
-            "model": "LightGBM",
-            "net_uah": net_lgb,
-            "pct_of_ideal": round((net_lgb / net_perfect * 100.0) if net_perfect > 0 else 0, 1),
-            "description": "24 Direct Models + Quantiles",
-        },
-        {
-            "model": "Perfect Foresight (Ідеал)",
-            "net_uah": net_perfect,
-            "pct_of_ideal": 100.0,
-            "description": "Теоретична верхня межа (істинні ціни)",
-        },
+        _build_item("Naive (Вчора)", "v1.0.0", res_naive, "Baseline персистенція"),
+        _build_item("LightGBM", "v1.0.0", res_lgb, "24 Direct Models + Quantiles"),
+        _build_item(
+            "Perfect Foresight (Ідеал)", "v1.0.0", res_perf, "Теоретична верхня межа (істинні ціни)"
+        ),
     ]
 
     return results
@@ -213,7 +235,9 @@ def main() -> None:
     print(f"{'Модель':<28} | {'Чистий прибуток (грн)':<22} | {'% від Ідеалу':<14}")
     print("-" * 75)
     for r in results:
-        print(f"{r['model']:<28} | {r['net_uah']:>20,.2f} | {r['pct_of_ideal']:>12.1f}%")
+        print(
+            f"{r['model']:<28} | {r['net_uah']:>20,.2f} | {r['pct_of_perfect_foresight']:>12.1f}%"
+        )
     print("-" * 75)
 
 

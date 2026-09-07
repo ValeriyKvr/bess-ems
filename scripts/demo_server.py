@@ -752,12 +752,42 @@ async def get_events(limit: int = 30):
     ]
 
 
+# --- HEALTH & STATUS (SPEC §11) ---
+# Without these the SPA catch-all below answers /api/health and /api/status with
+# index.html, so the UI's response.json() fails and the dashboard reports the
+# backend as unreachable.
+@app.get("/api/health")
+async def get_health():
+    return {"status": "healthy", "service": "demo-server", "database": True}
+
+
+@app.get("/api/status")
+async def get_system_status():
+    sim_t = get_current_sim_time()
+    return {
+        "status": "ONLINE",
+        "clock": {
+            "ts_sim": sim_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "speed": sim_state["speed"],
+            "is_paused": not sim_state["is_running"],
+        },
+        "mqtt_connected": True,
+        "bess_connected": True,
+        "active_bess": ["bess-01"],
+        "stage": "Demo (standalone, no DB/MQTT)",
+    }
+
+
 # --- STATIC SPA FILES ---
 if DIST_DIR.exists():
     app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="assets")
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
+        # An unknown /api/ path is a bug, not a client-side route — answering it with
+        # index.html hides the failure behind an HTML parse error in the browser.
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail=f"Unknown API route: /{full_path}")
         target = DIST_DIR / full_path
         if target.is_file():
             return FileResponse(target)

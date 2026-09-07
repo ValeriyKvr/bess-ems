@@ -64,6 +64,8 @@ services:
       SIM_TICK_SECONDS: ${SIM_TICK_SECONDS:-60}
     ports:
       - "8000:8000"
+    volumes:
+      - ems_models:/app/models
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -121,3 +123,4 @@ services:
 volumes:
   pgdata:
   mosquitto_data:
+  ems_models:

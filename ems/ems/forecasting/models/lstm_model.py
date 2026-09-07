@@ -250,5 +250,7 @@ class LstmModel(ForecastModel):
         )
         weights_file = path / "model.pt"
         if weights_file.exists():
-            self.net.load_state_dict(torch.load(str(weights_file), map_location="cpu"))
+            self.net.load_state_dict(
+                torch.load(str(weights_file), map_location="cpu", weights_only=True)
+            )
         self.net.eval()

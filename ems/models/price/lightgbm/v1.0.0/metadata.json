@@ -1,0 +1,15 @@
+{
+  "name": "lightgbm",
+  "version": "v1.0.0",
+  "target": "price",
+  "trained_at": "2026-09-06T13:12:32.535869+00:00",
+  "train_samples": 13728,
+  "test_samples": 3433,
+  "metrics": {
+    "mae": 235.5,
+    "mape": 4.63,
+    "rmse": 366.85,
+    "spearman_rank_corr": 0.9724
+  },
+  "artifact_path": "models/price/lightgbm/v1.0.0"
+}

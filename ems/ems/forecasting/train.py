@@ -170,6 +170,7 @@ async def train_model_pipeline(
     artifact_dir = root / target / model.name / version
     model.save(artifact_dir)
 
+    rel_artifact_path = f"models/{target}/{model.name}/{version}"
     metadata = {
         "name": model.name,
         "version": version,
@@ -178,7 +179,7 @@ async def train_model_pipeline(
         "train_samples": len(X_train),
         "test_samples": len(X_test),
         "metrics": metrics,
-        "artifact_path": str(artifact_dir),
+        "artifact_path": rel_artifact_path,
     }
 
     with open(artifact_dir / "metadata.json", "w", encoding="utf-8") as f:
@@ -195,7 +196,7 @@ async def train_model_pipeline(
                     target=target,
                     trained_at=datetime.now(tz=UTC),
                     metrics=metrics,
-                    artifact_path=str(artifact_dir),
+                    artifact_path=rel_artifact_path,
                     is_active=(model.name == "lightgbm"),
                 )
                 .on_conflict_do_update(
@@ -203,7 +204,7 @@ async def train_model_pipeline(
                     set_={
                         "metrics": metrics,
                         "trained_at": datetime.now(tz=UTC),
-                        "artifact_path": str(artifact_dir),
+                        "artifact_path": rel_artifact_path,
                     },
                 )
             )

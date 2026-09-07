@@ -11,7 +11,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from ems.core.config import EmsSettings
-from ems.db.models import DamPrice, DispatchLog, Forecast, MlModel
+from ems.db.models import DamPrice, DispatchLog, Forecast, MlModel, SiteLoad
 from ems.forecasting.features import build_inference_features
 from ems.forecasting.models.base import ForecastModel
 from ems.forecasting.models.naive import NaiveModel
@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 async def load_active_model(target: str = "price", session: Any = None) -> ForecastModel:
-    """Load the currently active model from the ML model registry or fallback to NaiveModel."""
+    """Load the currently active model from the ML model registry or fallback to disk/NaiveModel."""
+    models_root = Path(__file__).resolve().parent.parent.parent / "models"
+
     if session is not None:
         stmt = (
             select(MlModel)
@@ -31,9 +33,19 @@ async def load_active_model(target: str = "price", session: Any = None) -> Forec
             .limit(1)
         )
         row = (await session.execute(stmt)).scalar_one_or_none()
-        if row and row.artifact_path:
-            artifact_dir = Path(row.artifact_path)
-            if artifact_dir.exists():
+        if row:
+            artifact_dir: Path | None = None
+            if row.artifact_path:
+                p = Path(row.artifact_path)
+                if p.exists():
+                    artifact_dir = p
+            if artifact_dir is None:
+                # Handle host vs container path differences
+                candidate = models_root / row.target / row.name / row.version
+                if candidate.exists():
+                    artifact_dir = candidate
+
+            if artifact_dir and artifact_dir.exists():
                 try:
                     model = get_model_instance(row.name, target=target, horizon_h=24)
                     model.load(artifact_dir)
@@ -45,6 +57,20 @@ async def load_active_model(target: str = "price", session: Any = None) -> Forec
                 except Exception as e:
                     logger.warning("Failed to load active model artifact %s: %s", artifact_dir, e)
 
+    # If not loaded from DB, check if pre-trained lightgbm model exists on disk
+    default_dir = models_root / target / "lightgbm" / "v1.0.0"
+    if default_dir.exists():
+        try:
+            model = get_model_instance("lightgbm", target=target, horizon_h=24)
+            model.load(default_dir)
+            model.version = "v1.0.0"
+            logger.info(
+                "Loaded pre-trained disk model lightgbm:v1.0.0 for %s from %s", target, default_dir
+            )
+            return model
+        except Exception as e:
+            logger.warning("Failed to load pre-trained disk model %s: %s", default_dir, e)
+
     # Fallback to NaiveModel
     logger.info("Using baseline NaiveModel for %s forecasting", target)
     return NaiveModel(target=target, horizon_h=24)
@@ -54,32 +80,47 @@ async def generate_day_ahead_forecast(
     target_date: date,
     sim_dt: datetime,
     session: Any,
+    target: str = "price",
 ) -> list[dict[str, Any]]:
     """Generate 24h forecast for D+1 at 11:00 and persist to forecasts table (SPEC §6.3)."""
     horizon_start = datetime(target_date.year, target_date.month, target_date.day, 0, 0, tzinfo=UTC)
 
     # 1. Load active model
-    model = await load_active_model(target="price", session=session)
+    model = await load_active_model(target=target, session=session)
 
-    # 2. Get past 350 hours of price data before horizon_start
+    # 2. Get past 350 hours of historical data before horizon_start
     hist_start = horizon_start - timedelta(hours=350)
-    stmt = (
-        select(DamPrice)
-        .where(DamPrice.ts >= hist_start, DamPrice.ts < horizon_start)
-        .order_by(DamPrice.ts)
-    )
-    rows = (await session.execute(stmt)).scalars().all()
+    target_col = "price" if target == "price" else "load"
 
-    if len(rows) >= 336:
-        df_hist = pd.DataFrame([{"ts": r.ts, "price": r.price_uah_mwh} for r in rows])
+    if target == "price":
+        stmt = (
+            select(DamPrice)
+            .where(DamPrice.ts >= hist_start, DamPrice.ts < horizon_start)
+            .order_by(DamPrice.ts)
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+        if len(rows) >= 336:
+            df_hist = pd.DataFrame([{"ts": r.ts, "price": r.price_uah_mwh} for r in rows])
+        else:
+            gen = SyntheticDataGenerator(seed=42)
+            df_synth = gen.generate_dam_prices(hist_start, horizon_start - timedelta(hours=1))
+            df_hist = df_synth.rename(columns={"price_uah_mwh": "price"})
     else:
-        # Generate synthetic history up to cutoff_ts to ensure sufficient lag windows
-        gen = SyntheticDataGenerator(seed=42)
-        df_synth = gen.generate_dam_prices(hist_start, horizon_start - timedelta(hours=1))
-        df_hist = df_synth.rename(columns={"price_uah_mwh": "price"})
+        stmt = (
+            select(SiteLoad)
+            .where(SiteLoad.ts >= hist_start, SiteLoad.ts < horizon_start)
+            .order_by(SiteLoad.ts)
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+        if len(rows) >= 336:
+            df_hist = pd.DataFrame([{"ts": r.ts, "load": r.load_kw} for r in rows])
+        else:
+            gen = SyntheticDataGenerator(seed=42)
+            df_synth = gen.generate_site_load(hist_start, horizon_start - timedelta(hours=1))
+            df_hist = df_synth.rename(columns={"load_kw": "load"})
 
     # 3. Construct inference features
-    X_inf = build_inference_features(df_hist, target_col="price")
+    X_inf = build_inference_features(df_hist, target_col=target_col)
 
     # 4. Predict
     preds = model.predict(X_inf)
@@ -100,7 +141,7 @@ async def generate_day_ahead_forecast(
             pg_insert(Forecast)
             .values(
                 ts=step_ts,
-                target="price",
+                target=target,
                 model_name=model.name,
                 model_version=getattr(model, "version", "v1.0.0"),
                 created_at_sim=sim_dt,
@@ -121,19 +162,24 @@ async def generate_day_ahead_forecast(
         )
         await session.execute(stmt)
 
-        results.append(
-            {
-                "ts": step_ts,
-                "price_dam": val,
-                "p10": p10_val,
-                "p90": p90_val,
-                "model": model.name,
-                "version": getattr(model, "version", "v1.0.0"),
-            }
-        )
+        item = {
+            "ts": step_ts,
+            "value": val,
+            "p10": p10_val,
+            "p90": p90_val,
+            "model": model.name,
+            "version": getattr(model, "version", "v1.0.0"),
+        }
+        if target == "price":
+            item["price_dam"] = val
+        else:
+            item["load_kw"] = val
+        results.append(item)
 
     await session.commit()
-    logger.info("Persisted 24 forecasts for %s generated by %s", target_date, model.name)
+    logger.info(
+        "Persisted 24 forecasts for %s (%s) generated by %s", target_date, target, model.name
+    )
     return results
 
 

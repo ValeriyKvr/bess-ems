@@ -8,6 +8,7 @@ Trains independent LightGBM regressors for each step h in 1..24:
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import lightgbm as lgb
@@ -53,6 +54,8 @@ class LightGbmModel(ForecastModel):
 
         total_mae = 0.0
         n_samples = len(X)
+        # Cap n_jobs to prevent CPU thrashing / thread starvation in containerized environments
+        effective_n_jobs = min(4, max(1, (os.cpu_count() or 1) // 2 or 1))
 
         for h in range(1, self.horizon_h + 1):
             target_col = f"h_{h}"
@@ -65,7 +68,7 @@ class LightGbmModel(ForecastModel):
                 learning_rate=self.learning_rate,
                 num_leaves=self.num_leaves,
                 verbosity=-1,
-                n_jobs=-1,
+                n_jobs=effective_n_jobs,
                 random_state=42,
             )
             m_point.fit(X, y_h)
@@ -83,7 +86,7 @@ class LightGbmModel(ForecastModel):
                 learning_rate=self.learning_rate,
                 num_leaves=max(12, self.num_leaves // 2),
                 verbosity=-1,
-                n_jobs=-1,
+                n_jobs=effective_n_jobs,
                 random_state=42,
             )
             m_p10.fit(X, y_h)
@@ -97,7 +100,7 @@ class LightGbmModel(ForecastModel):
                 learning_rate=self.learning_rate,
                 num_leaves=max(12, self.num_leaves // 2),
                 verbosity=-1,
-                n_jobs=-1,
+                n_jobs=effective_n_jobs,
                 random_state=42,
             )
             m_p90.fit(X, y_h)

@@ -1,0 +1,15 @@
+{
+  "name": "naive",
+  "version": "v1.0.0",
+  "target": "price",
+  "trained_at": "2026-09-06T13:11:51.107825+00:00",
+  "train_samples": 13728,
+  "test_samples": 3433,
+  "metrics": {
+    "mae": 467.0,
+    "mape": 9.4,
+    "rmse": 690.3,
+    "spearman_rank_corr": 0.949
+  },
+  "artifact_path": "C:\\Users\\\u0412\u0430\u043b\u0435\u0440\u0438\u0439\\Desktop\\gemini bess ems\\ems\\models\\price\\naive\\v1.0.0"
+}

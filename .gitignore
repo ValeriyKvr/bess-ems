@@ -58,5 +58,9 @@ Thumbs.db
 
 # ML models artifacts checkpoints
 models/
-ems/models/
+!ems/models/
+!ems/models/price/
+!ems/models/price/**
+!ems/models/load/
+!ems/models/load/**
 !ems/ems/forecasting/models/

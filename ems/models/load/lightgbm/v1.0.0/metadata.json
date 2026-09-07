@@ -1,0 +1,15 @@
+{
+  "name": "lightgbm",
+  "version": "v1.0.0",
+  "target": "load",
+  "trained_at": "2026-09-07T06:19:02.051485+00:00",
+  "train_samples": 13728,
+  "test_samples": 3433,
+  "metrics": {
+    "mae": 8.07,
+    "mape": 4.08,
+    "rmse": 11.25,
+    "spearman_rank_corr": 0.6165
+  },
+  "artifact_path": "models/load/lightgbm/v1.0.0"
+}

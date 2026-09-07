@@ -157,27 +157,29 @@ async def get_forecasts(
 
 @router.post("/forecasts/run")
 async def run_forecast_now(target: str = "price") -> dict[str, Any]:
-    """Trigger immediate forecast generation for Day-Ahead horizon (SPEC §11)."""
-    from ems.forecasting.forecaster import NaiveForecaster
+    """Trigger immediate forecast generation using active ML model (SPEC §11)."""
+    from ems.forecasting.service import generate_day_ahead_forecast
+    from ems.main import app_state
 
-    forecaster = NaiveForecaster()
-    now_utc = datetime.now(tz=UTC)
-    start_dt = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    sim_now = app_state.clock.now() if app_state.clock else datetime.now(tz=UTC)
+    target_date = (sim_now + timedelta(days=1)).date()
 
     async with async_session_factory() as session:
-        if target == "price":
-            forecasts = await forecaster.forecast_price(start_dt, 24, session)
-        else:
-            forecasts = await forecaster.forecast_load(start_dt, 24, session)
+        forecasts = await generate_day_ahead_forecast(
+            target_date=target_date,
+            sim_dt=sim_now,
+            session=session,
+            target=target,
+        )
 
     return {
         "status": "success",
         "target": target,
-        "horizon_h": 24,
+        "horizon_h": len(forecasts),
         "forecasts": [
             {
                 "ts": f["ts"].isoformat(),
-                "value": f.get("price_dam") or f.get("load_kw"),
+                "value": f.get("price_dam") if target == "price" else f.get("load_kw"),
                 "p10": f.get("p10"),
                 "p90": f.get("p90"),
             }
