@@ -143,7 +143,7 @@ class Battery:
         """
         # Step 1: Limits & PCS Setpoint Clipping
         avail_ch, avail_dis = self.bms.calculate_available_power(
-            self.soc_pct, self.config.power_max_kw
+            self.soc_pct, self.config.power_max_kw, temp_c=self.thermal.temp_c
         )
 
         # Discrete-step energy headroom: prevent large dt from overshooting soc_max or undershooting soc_min

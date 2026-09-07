@@ -31,6 +31,7 @@ class BmsManager:
         self,
         soc_pct: float,
         power_max_kw: float,
+        temp_c: float = 25.0,
     ) -> tuple[float, float]:
         """Calculate allowable charge and discharge power with linear derating near limits (SPEC §5.2).
 
@@ -59,6 +60,24 @@ class BmsManager:
             span = self.config.soc_derate_discharge_start_pct - self.config.soc_min_pct
             ratio = (soc_pct - self.config.soc_min_pct) / span if span > 0 else 0.0
             avail_discharge = max(0.0, min(power_max_kw, power_max_kw * ratio))
+
+        # 3. High temperature derating: linearly derates when temp_c approaches temp_max_c
+        # (derates within 5°C of trip threshold to avoid emergency trips)
+        temp_derate_start = max(30.0, self.config.temp_max_c - 5.0)
+        if temp_c >= self.config.temp_max_c:
+            avail_charge = 0.0
+            avail_discharge = 0.0
+        elif temp_c > temp_derate_start:
+            t_span = self.config.temp_max_c - temp_derate_start
+            t_ratio = max(0.0, (self.config.temp_max_c - temp_c) / t_span)
+            avail_charge *= t_ratio
+            avail_discharge *= t_ratio
+
+        # 4. Low temperature charging derating: LFP cannot charge below 0°C (lithium plating)
+        if temp_c <= 0.0:
+            avail_charge = 0.0
+        elif temp_c < 10.0:
+            avail_charge *= max(0.0, temp_c / 10.0)
 
         return round(avail_charge, 2), round(avail_discharge, 2)
 

@@ -221,3 +221,19 @@ def test_discrete_step_energy_headroom_prevents_overshoot_at_high_dt() -> None:
     assert telemetry.soc_pct <= 90.0 or telemetry.soc_pct == pytest.approx(90.0, abs=1e-3)
     assert battery.bms.state != BessOperationalState.FAULT
     assert "FAULT" not in telemetry.state
+
+
+def test_thermal_derating_and_cold_charge_protection() -> None:
+    """Requirement: BMS derates power at high temperature and forbids charging below 0°C."""
+    config = BatteryConfig(temp_max_c=45.0)
+    bms = Battery(config=config).bms
+
+    # At 42.5°C (midpoint between 40°C and 45°C): power is derated by 50%
+    ch, dis = bms.calculate_available_power(50.0, 500.0, temp_c=42.5)
+    assert pytest.approx(ch, abs=2.0) == 250.0
+    assert pytest.approx(dis, abs=2.0) == 250.0
+
+    # At -5°C: charging is 0 kW (lithium plating protection), discharging allowed
+    ch_cold, dis_cold = bms.calculate_available_power(50.0, 500.0, temp_c=-5.0)
+    assert ch_cold == 0.0
+    assert dis_cold == 500.0
