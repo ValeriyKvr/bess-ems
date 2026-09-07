@@ -146,6 +146,25 @@ class Battery:
             self.soc_pct, self.config.power_max_kw
         )
 
+        # Discrete-step energy headroom: prevent large dt from overshooting soc_max or undershooting soc_min
+        if dt_seconds > 0.0 and self.capacity_actual_kwh > 0.0:
+            dt_h = dt_seconds / 3600.0
+            eff_ch = max(0.01, self.config.eff_charge)
+            e_room_ch_kwh = max(
+                0.0,
+                (self.config.soc_max_pct - self.soc_pct) / 100.0 * self.capacity_actual_kwh,
+            )
+            max_p_ch_energy = e_room_ch_kwh / (dt_h * eff_ch)
+            avail_ch = min(avail_ch, max_p_ch_energy)
+
+            eff_dis = max(0.01, self.config.eff_discharge)
+            e_room_dis_kwh = max(
+                0.0,
+                (self.soc_pct - self.config.soc_min_pct) / 100.0 * self.capacity_actual_kwh,
+            )
+            max_p_dis_energy = (e_room_dis_kwh * eff_dis) / dt_h
+            avail_dis = min(avail_dis, max_p_dis_energy)
+
         if self.bms.state == BessOperationalState.FAULT:
             self.pcs.reset_power()
             actual_power_kw = 0.0

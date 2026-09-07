@@ -147,6 +147,21 @@ export async function injectFault(
   return response.json();
 }
 
+export async function sendBessCommand(
+  cmd: string
+): Promise<{ status: string; cmd: string; bess_id?: string }> {
+  const response = await fetch('/api/bess/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cmd }),
+  });
+  if (!response.ok) {
+    throw new Error(await errorText(response, `Failed to send BESS command ${cmd}`));
+  }
+  return response.json();
+}
+
+
 // ── Data API ─────────────────────────────────────────────────────────────────
 
 export async function previewCsvData(

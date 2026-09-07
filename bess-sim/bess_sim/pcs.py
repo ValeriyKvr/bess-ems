@@ -47,6 +47,9 @@ class PcsModel:
         else:
             self.actual_power_kw = clipped_target_kw
 
+        # Hard clamp against allowable BMS envelope: ramp rate can never override BMS limits
+        self.actual_power_kw = max(-eff_max_dis, min(eff_max_ch, self.actual_power_kw))
+
         return round(self.actual_power_kw, 4)
 
     def reset_power(self) -> None:

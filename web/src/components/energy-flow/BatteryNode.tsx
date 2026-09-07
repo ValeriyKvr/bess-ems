@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react';
-import { Zap, Thermometer, ShieldAlert, HeartPulse } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Zap, Thermometer, ShieldAlert, HeartPulse, RotateCcw } from 'lucide-react';
+import { sendBessCommand } from '../../api/client';
 
 export interface BatteryNodeProps {
   socPct: number;
@@ -20,6 +21,7 @@ export function BatteryNode({
   const wavePathRef = useRef<SVGPathElement | null>(null);
   const phaseRef = useRef<number>(0);
   const animFrameRef = useRef<number | null>(null);
+  const [isResetting, setIsResetting] = useState(false);
 
   const isCharging = powerKw > 1.0;
   const isDischarging = powerKw < -1.0;
@@ -191,9 +193,29 @@ export function BatteryNode({
       </div>
 
       {isFault && (
-        <div className="w-full mt-2 py-1 px-2 rounded-md bg-red-900/40 border border-red-700/60 flex items-center gap-1.5 text-[11px] text-red-200">
-          <ShieldAlert className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />
-          <span>Спрацював аварійний захист</span>
+        <div className="w-full mt-2 flex flex-col gap-1.5">
+          <div className="py-1 px-2 rounded-md bg-red-900/40 border border-red-700/60 flex items-center gap-1.5 text-[11px] text-red-200">
+            <ShieldAlert className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />
+            <span>Спрацював аварійний захист</span>
+          </div>
+          <button
+            type="button"
+            disabled={isResetting}
+            onClick={async () => {
+              try {
+                setIsResetting(true);
+                await sendBessCommand('reset_alarm');
+              } catch (e) {
+                console.error('Failed to reset alarm:', e);
+              } finally {
+                setIsResetting(false);
+              }
+            }}
+            className="w-full flex items-center justify-center gap-1.5 py-1 px-2 rounded-md bg-red-800 hover:bg-red-700 active:bg-red-900 text-white text-[11px] font-semibold transition-colors shadow"
+          >
+            <RotateCcw className={`w-3 h-3 ${isResetting ? 'animate-spin' : ''}`} />
+            <span>{isResetting ? 'Скидання...' : 'Скинути аварію'}</span>
+          </button>
         </div>
       )}
     </div>

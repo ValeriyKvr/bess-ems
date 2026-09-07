@@ -4,7 +4,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from bess_sim.battery import Battery
@@ -27,9 +27,10 @@ class BessSimulatorApp:
         self.battery = Battery(config=self.config.battery, bess_id=self.config.bess_id)
         self.running = False
 
+        self.clock_received: bool = False
         self.current_setpoint_kw: float = 0.0
-        self.last_sim_time: str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.last_sim_datetime: datetime = datetime.now(UTC)
+        self.last_sim_time: str = "2026-03-01T00:00:00Z"
+        self.last_sim_datetime: datetime = datetime(2026, 3, 1, 0, 0, 0, tzinfo=UTC)
         self.last_clock_msg_wall_ts: float = 0.0
         self.last_wall_tick_ts: float = time.time()
         self.last_published_state: str = ""
@@ -74,15 +75,26 @@ class BessSimulatorApp:
 
     def on_clock_tick(self, payload: dict[str, Any]) -> None:
         """Handle incoming clock tick from EMS (SPEC §4.3)."""
+        self.clock_received = True
         self.last_clock_msg_wall_ts = time.time()
         ts_sim_str = payload.get("ts_sim")
         if not ts_sim_str:
             return
 
+        is_paused = payload.get("is_paused", False)
+        speed = payload.get("speed", 60)
+
         try:
             current_sim_dt = datetime.fromisoformat(ts_sim_str.replace("Z", "+00:00"))
         except Exception:
-            current_sim_dt = datetime.now(UTC)
+            current_sim_dt = datetime(2026, 3, 1, 0, 0, 0, tzinfo=UTC)
+
+        # If clock is paused or speed is 0, refresh telemetry with dt=0 (no physical advance)
+        if is_paused or speed == 0:
+            self.last_sim_datetime = current_sim_dt
+            self.last_sim_time = ts_sim_str
+            self._execute_step(dt_seconds=0.0)
+            return
 
         # Calculate simulation dt elapsed since previous tick
         dt_seconds = (current_sim_dt - self.last_sim_datetime).total_seconds()
@@ -181,18 +193,19 @@ class BessSimulatorApp:
             )
 
     def run_wall_clock_fallback(self) -> None:
-        """Fallback stepping when sim/clock is not received from EMS."""
+        """Fallback stepping only when sim/clock was NEVER received from EMS (standalone mode)."""
+        if self.clock_received:
+            return
+
         now_ts = time.time()
         elapsed = now_ts - self.last_wall_tick_ts
 
         # Fallback period: default 1 second wall clock
         interval_seconds = max(0.5, self.config.telemetry_interval_ms / 1000.0)
         if elapsed >= interval_seconds:
-            # If no external clock has been seen for > 2.0 seconds, advance in real time
-            if (now_ts - self.last_clock_msg_wall_ts) > 2.0:
-                self.last_sim_datetime = datetime.now(UTC)
-                self.last_sim_time = self.last_sim_datetime.strftime("%Y-%m-%dT%H:%M:%SZ")
-                self._execute_step(dt_seconds=elapsed)
+            self.last_sim_datetime = self.last_sim_datetime + timedelta(seconds=elapsed)
+            self.last_sim_time = self.last_sim_datetime.strftime("%Y-%m-%dT%H:%M:%SZ")
+            self._execute_step(dt_seconds=elapsed)
             self.last_wall_tick_ts = now_ts
 
     def start(self) -> None:

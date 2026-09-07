@@ -18,6 +18,7 @@ import {
   fetchSettingsSection,
   updateSettingsSection,
   injectFault,
+  sendBessCommand,
   fetchHealth,
 } from '../../api/client';
 import { SettingsSchemaResponse } from '../../types';
@@ -105,7 +106,12 @@ export const SettingsPage: React.FC = () => {
     setFaultStatus(`Запуск: ${type}...`);
     try {
       await injectFault(type);
-      setFaultStatus(`Аварія ${type} активована успішно`);
+      if (type === 'clear_all') {
+        await sendBessCommand('reset_alarm').catch(() => {});
+        setFaultStatus('Всі несправності очищено, аварійний стан скинуто');
+      } else {
+        setFaultStatus(`Аварія ${type} активована успішно`);
+      }
     } catch (err: any) {
       setFaultStatus(`Помилка: ${err.message}`);
     }

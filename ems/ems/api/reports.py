@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -263,6 +263,7 @@ async def get_report_summary(
 
 @router.get("/compare-strategies")
 async def compare_strategies(
+    request: Request,
     target_date: str | None = Query(None, alias="date", description="Target date YYYY-MM-DD"),
     strategies_str: str = Query(
         "TOU_SIMPLE,ARBITRAGE,PEAK_SHAVING,SELF_CONSUMPTION",
@@ -278,7 +279,12 @@ async def compare_strategies(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid date format: {e}") from e
     else:
-        d = datetime.now(UTC).date()
+        # GEMINI.md: Never use datetime.now() for business logic — use clock.now()
+        app_clock = getattr(getattr(request, "app", None), "state", None)
+        if app_clock and getattr(app_clock, "clock", None):
+            d = app_clock.clock.now().date()
+        else:
+            d = datetime(2026, 3, 1, tzinfo=UTC).date()
 
     start_dt = datetime(d.year, d.month, d.day, 0, 0, tzinfo=UTC)
     end_dt = start_dt + timedelta(hours=23)

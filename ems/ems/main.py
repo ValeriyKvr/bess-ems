@@ -94,6 +94,9 @@ class ApplicationState:
         # Backoff for on-the-fly schedule construction when the DB is unavailable
         self._last_schedule_attempt: datetime | None = None
 
+        # Timestamp tracking how long BESS has been in a physically safe state during a fault
+        self._bess_fault_safe_since: datetime | None = None
+
 
 app_state = ApplicationState()
 
@@ -738,6 +741,33 @@ def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
 
     # Run dispatcher tick
     decision = app_state.dispatcher.tick(sim_time)
+
+    # Auto-recovery watchdog: if BESS reported FAULT, check if physical conditions
+    # have returned to safe operating bounds (SoC 12-88%, Temp <= 40°C) for >= 30 seconds.
+    # If so, dispatch an automatic reset_alarm supervisory command to clear the latch.
+    if app_state.dispatcher.state == "SAFE_MODE":
+        tdata = _bess_telemetry()
+        if tdata.get("state") == "FAULT":
+            cur_soc = float(tdata.get("soc_pct", 50.0))
+            cur_temp = float(tdata.get("temp_c", 25.0))
+            if 12.0 <= cur_soc <= 88.0 and cur_temp <= 40.0:
+                if app_state._bess_fault_safe_since is None:
+                    app_state._bess_fault_safe_since = sim_time
+                elif (sim_time - app_state._bess_fault_safe_since).total_seconds() >= 30.0:
+                    logger.info(
+                        "BESS telemetry safe for >= 30s. Sending auto-recovery reset_alarm."
+                    )
+                    if app_state.mqtt and app_state.mqtt.is_connected:
+                        app_state.mqtt.publish_command(
+                            app_state.settings.bess_id, {"cmd": "reset_alarm"}
+                        )
+                    app_state._bess_fault_safe_since = None
+            else:
+                app_state._bess_fault_safe_since = None
+        else:
+            app_state._bess_fault_safe_since = None
+    else:
+        app_state._bess_fault_safe_since = None
 
     # Closed-loop check: does the measured SoC still track the plan? (SPEC §6.5)
     if bess_soc_pct is not None:

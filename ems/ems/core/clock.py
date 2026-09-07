@@ -194,6 +194,7 @@ class SimulationClock:
         """Start async background worker running the simulation clock."""
         self._stop_event.clear()
         wall_interval_sec = 0.5  # wall clock stepping rate
+        paused_heartbeat_counter = 0
 
         logger.info("SimulationClock background loop started.")
         while not self._stop_event.is_set():
@@ -208,6 +209,16 @@ class SimulationClock:
                         mqtt_publish_fn(self.to_dict())
                     except Exception as e:
                         logger.error("Failed to publish sim/clock: %s", e)
+            else:
+                # Paused or speed=0: emit heartbeat every ~2s so clients and BESS stay synced
+                paused_heartbeat_counter += 1
+                if paused_heartbeat_counter >= int(2.0 / wall_interval_sec):
+                    paused_heartbeat_counter = 0
+                    if mqtt_publish_fn:
+                        try:
+                            mqtt_publish_fn(self.to_dict())
+                        except Exception as e:
+                            logger.error("Failed to publish sim/clock heartbeat: %s", e)
 
     def stop_loop(self) -> None:
         """Stop background worker."""

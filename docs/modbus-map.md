@@ -42,9 +42,7 @@ s.sendall(request)
 response = s.recv(1024)
 header = response[:9]
 payload = response[9:]
-soc_raw, power_kw, voltage_raw, temp_raw, state, setpoint_kw = struct.unpack(
-    ">HhHhHh", payload
-)
+soc_raw, power_kw, voltage_raw, temp_raw, state, setpoint_kw = struct.unpack(">HhHhHh", payload)
 
 print(f"SoC: {soc_raw / 100.0:.2f}%")
 print(f"Power: {power_kw} kW")
@@ -66,11 +64,7 @@ client.connect()
 rr = client.read_holding_registers(address=0, count=6, slave=1)
 if not rr.isError():
     soc = rr.registers[0] / 100.0
-    power = (
-        rr.registers[1]
-        if rr.registers[1] < 32768
-        else rr.registers[1] - 65536
-    )
+    power = rr.registers[1] if rr.registers[1] < 32768 else rr.registers[1] - 65536
     print(f"BESS SoC: {soc}%, Power: {power} kW")
 
 # Write power setpoint -250 kW (discharge)

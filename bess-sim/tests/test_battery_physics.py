@@ -195,3 +195,29 @@ def test_overheat_protection_and_reset_alarm() -> None:
     # Now reset succeeds
     assert battery.handle_command("reset_alarm")
     assert battery.bms.state == BessOperationalState.STANDBY
+
+
+def test_discrete_step_energy_headroom_prevents_overshoot_at_high_dt() -> None:
+    """Requirement: Discrete step with large dt must not overshoot soc_max or soc_min."""
+    config = BatteryConfig(
+        capacity_kwh=1000.0,
+        power_max_kw=500.0,
+        ramp_rate_kw_s=1000.0,
+        initial_soc_pct=88.0,
+        soc_max_pct=90.0,
+        soc_hard_max_pct=97.0,
+    )
+    battery = Battery(config=config)
+
+    # Large time step (e.g. 600s = 10 min) at full 500 kW charge
+    telemetry = battery.step(
+        setpoint_kw=500.0,
+        dt_seconds=600.0,
+        include_aux=False,
+        include_self_discharge=False,
+    )
+
+    # SoC must be clamped so it does not exceed soc_max_pct (90%)
+    assert telemetry.soc_pct <= 90.0 or telemetry.soc_pct == pytest.approx(90.0, abs=1e-3)
+    assert battery.bms.state != BessOperationalState.FAULT
+    assert "FAULT" not in telemetry.state
