@@ -20,7 +20,7 @@ import { fetchTemplates, applyTemplate } from '../../api/client';
 import { SimulationTemplate } from '../../types';
 
 export function ClockPanel() {
-  const { currentTick, setSpeed, pauseSim, resumeSim, stepSim, jumpTo } = useTelemetryStore();
+  const { currentTick, setSpeed, pauseSim, resumeSim, stepSim, jumpTo, fetchLatestSchedule } = useTelemetryStore();
 
   const clock = currentTick?.clock;
   const isPaused = clock?.is_paused ?? false;
@@ -51,11 +51,17 @@ export function ClockPanel() {
     setIsApplying(true);
     setApplySuccess(null);
     try {
-      await applyTemplate(selectedTemplateId, loopDays);
+      const res = await applyTemplate(selectedTemplateId, loopDays);
+      if (res && res.loop_start) {
+        await jumpTo(res.loop_start);
+      }
+      await fetchLatestSchedule();
       setApplySuccess('Шаблон активовано!');
       setTimeout(() => setApplySuccess(null), 3000);
     } catch (err) {
       console.error('Failed to apply template:', err);
+      setApplySuccess('Помилка активації');
+      setTimeout(() => setApplySuccess(null), 3000);
     } finally {
       setIsApplying(false);
     }

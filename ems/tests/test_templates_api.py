@@ -114,3 +114,34 @@ async def test_sim_control_loop_action() -> None:
         assert clock_data["loop_enabled"] is True
         assert clock_data["loop_start"] == "2026-09-01T00:00:00Z"
         assert clock_data["loop_end"] == "2026-09-06T00:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_apply_template_api() -> None:
+    """Test POST /api/sim/templates/{template_id}/apply immediately updates clock and activates schedule."""
+    from ems.dispatch.dispatcher import Dispatcher, DispatcherConfig
+    from ems.market.simulator import MarketSimulator
+
+    app_state.clock = SimulationClock(start_time="2026-03-01T00:00:00Z")
+    app_state.market = MarketSimulator()
+    app_state.dispatcher = Dispatcher(DispatcherConfig())
+
+    app.dependency_overrides[get_db] = override_get_db
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            "/api/sim/templates/enterprise_september_2026/apply",
+            json={"loop_days": 9},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "applied"
+        assert data["effective_loop_days"] == 9
+        assert data["loop_start"].startswith("2026-09-01")
+
+        # Verify runtime state was immediately updated to September
+        assert app_state.clock.now_iso().startswith("2026-09-01")
+        assert app_state.clock._loop_enabled is True
+        assert app_state.dispatcher.active_schedule is not None
+        assert str(app_state.dispatcher.active_schedule.horizon_start.date()) == "2026-09-01"
+

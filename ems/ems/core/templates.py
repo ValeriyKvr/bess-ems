@@ -199,10 +199,15 @@ async def apply_template(template_id: str, loop_days: int | None = None) -> dict
     await update_settings_section("strategy", strat_update)
     app_state._strategy_name = template.strategy
 
-    # 3. Configure Clock start and cyclic loop
+    # 3. Calculate start and end datetime
     start_dt = datetime.fromisoformat(template.start_time.replace("Z", "+00:00"))
     end_dt = start_dt + timedelta(days=effective_loop_days)
 
+    # 4. Preload cache & build fresh schedule for Day 1 FIRST so dispatcher is ready
+    await preload_telemetry_cache(start_dt)
+    await _build_schedule_for_date(start_dt.date(), start_dt)
+
+    # 4. Configure Clock start and cyclic loop, jump and publish over MQTT
     if app_state.clock:
         app_state.clock.set_loop(
             enabled=template.loop_cyclic,
@@ -210,13 +215,27 @@ async def apply_template(template_id: str, loop_days: int | None = None) -> dict
             end=end_dt,
         )
         app_state.clock.jump_to(start_dt)
+        if app_state.mqtt and app_state.mqtt.is_connected:
+            app_state.mqtt.publish_clock(app_state.clock.to_dict())
 
-    # 4. Preload cache & build fresh schedule for Day 1
-    await preload_telemetry_cache(start_dt)
-    await _build_schedule_for_date(start_dt.date(), start_dt)
+    # 5. Reset cumulative financial metrics for the new date
+    app_state._current_sim_date = start_dt.date()
+    app_state._today_net_uah = 0.0
+    app_state._today_baseline_uah = 0.0
 
-    # 5. Push battery configuration over MQTT to simulator
+    # 6. Broadcast immediate WebSocket tick to update web dashboard instantly
+    try:
+        from ems.main import _broadcast_ws_tick, _get_current_market_and_site
+
+        price_dam, load_kw, pv_kw = _get_current_market_and_site(start_dt)
+        decision = app_state.dispatcher.active_decision or app_state.dispatcher.tick(start_dt)
+        _broadcast_ws_tick(start_dt, decision, price_dam, load_kw, pv_kw, 0.0)
+    except Exception as ws_err:
+        logger.debug("Could not broadcast immediate WS tick on template apply: %s", ws_err)
+
+    # 7. Push battery configuration over MQTT to simulator
     from ems.api.settings import battery_config_payload
+
     payload = battery_config_payload(current_bat)
     payload.update(
         {
@@ -228,6 +247,7 @@ async def apply_template(template_id: str, loop_days: int | None = None) -> dict
         }
     )
     import asyncio
+
     asyncio.create_task(_publish_bess_config(payload))
 
     logger.info(

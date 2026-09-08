@@ -408,8 +408,12 @@ async def _build_schedule_for_date(target_date: date, sim_dt: datetime) -> None:
         if horizon_start >= horizon_end:
             horizon_end = horizon_start + timedelta(hours=24)
 
-        async with async_session_factory() as session:
-            tariffs = await app_state.market.get_hourly_tariffs(horizon_start, horizon_end, session)
+        tariffs = None
+        try:
+            async with async_session_factory() as session:
+                tariffs = await app_state.market.get_hourly_tariffs(horizon_start, horizon_end, session)
+        except Exception as e:
+            logger.warning("Could not fetch tariffs from DB (%s) — falling back to market profile.", e)
 
         if not tariffs:
             # Fallback synthetic tariffs if database is missing this date

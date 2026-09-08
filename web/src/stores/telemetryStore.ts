@@ -190,10 +190,24 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => ({
       } else {
         hourNum = target.hour;
         minuteNum = target.minute ?? 0;
-        const baseTs = get().currentTick?.clock?.ts_sim || '2026-03-02T00:00:00Z';
+        const baseTs = get().currentTick?.clock?.ts_sim || '2026-09-01T00:00:00Z';
         const d = new Date(baseTs);
         d.setUTCHours(hourNum, minuteNum, 0, 0);
         jumpToIso = d.toISOString();
+      }
+
+      // Optimistically update clock timestamp in store
+      const prevTick = get().currentTick;
+      if (prevTick && prevTick.clock) {
+        set({
+          currentTick: {
+            ...prevTick,
+            clock: {
+              ...prevTick.clock,
+              ts_sim: jumpToIso,
+            },
+          },
+        });
       }
 
       await fetch('/api/sim/control', {

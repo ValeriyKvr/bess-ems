@@ -60,7 +60,7 @@ services:
       # dispatches setpoints/config to another — no telemetry, no control.
       BESS_ID: ${BESS_ID:-bess-01}
       SIM_SPEED: ${SIM_SPEED:-60}
-      SIM_START_TIME: ${SIM_START_TIME:-2026-03-01T00:00:00Z}
+      SIM_START_TIME: ${SIM_START_TIME:-2026-09-01T00:00:00Z}
       SIM_TICK_SECONDS: ${SIM_TICK_SECONDS:-60}
     ports:
       - "8000:8000"
