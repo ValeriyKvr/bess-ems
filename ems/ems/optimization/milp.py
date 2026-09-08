@@ -95,12 +95,18 @@ def solve(problem: OptimizationProblem) -> Schedule:
     soc_max_kwh = capacity * (problem.soc_max_pct / 100.0)
     soc_0_kwh = capacity * (problem.initial_soc_pct / 100.0)
 
-    # End target: default to initial SoC if not specified
-    target_pct = (
-        problem.soc_end_target_pct
-        if problem.soc_end_target_pct is not None
-        else problem.initial_soc_pct
-    )
+    # End target: default to initial SoC for full-day 00:00 horizon (SPEC §9.3),
+    # but for intra-day horizons starting after 00:00, default to reserve_soc_pct
+    # or min(initial_soc_pct, 50.0) so stored energy can be discharged during peak hours.
+    if problem.soc_end_target_pct is not None:
+        target_pct = problem.soc_end_target_pct
+    elif problem.timestamps and problem.timestamps[0].hour > 0:
+        target_pct = min(
+            problem.initial_soc_pct,
+            max(problem.soc_min_pct, problem.reserve_soc_pct, 50.0),
+        )
+    else:
+        target_pct = problem.initial_soc_pct
     soc_end_target_kwh = capacity * (target_pct / 100.0)
 
     reserve_kwh = capacity * (problem.reserve_soc_pct / 100.0)

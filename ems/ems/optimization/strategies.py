@@ -100,6 +100,7 @@ class ScheduleContext:
     c_deg_uah_kwh: float | None = None
     eff_charge: float = 0.95
     eff_discharge: float = 0.95
+    soc_end_target_pct: float | None = None
 
 
 class Strategy(ABC):
@@ -377,6 +378,7 @@ class MilpStrategy(Strategy):
             c_deg_uah_kwh=context.c_deg_uah_kwh if context.c_deg_uah_kwh is not None else 1.25,
             eta_ch=context.eff_charge,
             eta_dis=context.eff_discharge,
+            soc_end_target_pct=context.soc_end_target_pct,
         )
 
         return solve(problem)

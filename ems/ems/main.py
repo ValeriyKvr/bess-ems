@@ -97,6 +97,10 @@ class ApplicationState:
         # Timestamp tracking how long BESS has been in a physically safe state during a fault
         self._bess_fault_safe_since: datetime | None = None
 
+        # Queued D+1 schedules (SPEC §6.3: D+1 becomes active at 00:00 midnight)
+        self._d_plus_one_schedule: Any | None = None
+        self._preliminary_schedule: Any | None = None
+
 
 app_state = ApplicationState()
 
@@ -326,7 +330,7 @@ async def _build_preliminary_schedule_with_forecast(sim_dt: datetime) -> None:
         schedule.params["eff_discharge"] = bat_cfg.eff_discharge
 
         await _persist_schedule(schedule)
-        app_state.dispatcher.set_schedule(schedule)
+        app_state._preliminary_schedule = schedule
 
         logger.info(
             "11:00 Preliminary schedule created with forecast: %s (profit=%.2f UAH)",
@@ -446,6 +450,11 @@ async def _build_schedule_for_date(target_date: date, sim_dt: datetime) -> None:
 
         c_deg = bat_cfg.degradation_cost_uah_per_kwh() * strat_cfg.degradation_cost_weight
 
+        if horizon_start.hour > 0:
+            soc_end_target = min(soc_pct, max(bat_cfg.soc_min_pct, strat_cfg.reserve_soc_pct, 50.0))
+        else:
+            soc_end_target = soc_pct
+
         context = ScheduleContext(
             current_time=sim_dt,
             horizon_start=horizon_start,
@@ -456,6 +465,7 @@ async def _build_schedule_for_date(target_date: date, sim_dt: datetime) -> None:
             max_discharge_kw=bat_cfg.power_max_kw,
             soc_min_pct=bat_cfg.soc_min_pct,
             soc_max_pct=bat_cfg.soc_max_pct,
+            soc_end_target_pct=soc_end_target,
             reserve_soc_pct=strat_cfg.reserve_soc_pct,
             peak_limit_kw=strat_cfg.peak_limit_kw,
             prices=tariffs,
@@ -479,15 +489,25 @@ async def _build_schedule_for_date(target_date: date, sim_dt: datetime) -> None:
         # Persist schedule to database
         await _persist_schedule(schedule)
 
-        # Activate in dispatcher
-        app_state.dispatcher.set_schedule(schedule)
-        logger.info(
-            "Schedule for %s built and activated: %s (%d items, profit=%.2f UAH)",
-            target_date,
-            schedule.id,
-            len(schedule.items),
-            schedule.expected_profit_uah or 0,
-        )
+        # SPEC §6.3: D+1 schedule becomes active at 00:00 of the next day
+        if target_date > sim_dt.date():
+            app_state._d_plus_one_schedule = schedule
+            logger.info(
+                "Schedule for %s built and queued for D+1 midnight activation: %s (%d items, profit=%.2f UAH)",
+                target_date,
+                schedule.id,
+                len(schedule.items),
+                schedule.expected_profit_uah or 0,
+            )
+        else:
+            app_state.dispatcher.set_schedule(schedule)
+            logger.info(
+                "Schedule for %s built and activated: %s (%d items, profit=%.2f UAH)",
+                target_date,
+                schedule.id,
+                len(schedule.items),
+                schedule.expected_profit_uah or 0,
+            )
 
         # Broadcast schedule event via WebSocket
         await ws_manager.broadcast_event(
@@ -581,6 +601,8 @@ async def on_rolling_reopt_trigger(sim_time: datetime, current_soc: float) -> No
 
         c_deg = bat_cfg.degradation_cost_uah_per_kwh() * strat_cfg.degradation_cost_weight
 
+        soc_end_target = active.params.get("start_soc_pct") or strat_cfg.reserve_soc_pct
+
         context = ScheduleContext(
             current_time=sim_time,
             horizon_start=horizon_start,
@@ -591,6 +613,7 @@ async def on_rolling_reopt_trigger(sim_time: datetime, current_soc: float) -> No
             max_discharge_kw=bat_cfg.power_max_kw,
             soc_min_pct=bat_cfg.soc_min_pct,
             soc_max_pct=bat_cfg.soc_max_pct,
+            soc_end_target_pct=soc_end_target,
             reserve_soc_pct=strat_cfg.reserve_soc_pct,
             peak_limit_kw=strat_cfg.peak_limit_kw,
             prices=tariffs,
@@ -706,10 +729,24 @@ def on_clock_tick(sim_time: datetime, delta_seconds: float) -> None:
     if not app_state.dispatcher or not app_state.clock:
         return
 
-    # Check if active schedule exists for current time; if not, build on the fly.
-    # Rate-limited: a failing build (e.g. database down) must not spam one task per tick.
+    # 1. Activate queued D+1 schedule when simulation time reaches its horizon start (00:00 of D+1)
+    if app_state._d_plus_one_schedule and sim_time >= app_state._d_plus_one_schedule.horizon_start:
+        logger.info(
+            "Activating D+1 schedule %s at sim_time %s",
+            app_state._d_plus_one_schedule.id,
+            sim_time,
+        )
+        app_state.dispatcher.set_schedule(app_state._d_plus_one_schedule)
+        app_state._d_plus_one_schedule = None
+
+    # 2. Check if active schedule covers current sim_time.
+    # The last hour slot starting at horizon_end is valid until horizon_end + 1 hour.
     active = app_state.dispatcher.active_schedule
-    if active is None or sim_time < active.horizon_start or sim_time >= active.horizon_end:
+    schedule_valid = (
+        active is not None
+        and active.horizon_start <= sim_time < (active.horizon_end + timedelta(hours=1))
+    )
+    if not schedule_valid:
         last_try = app_state._last_schedule_attempt
         if last_try is None or (sim_time - last_try) >= timedelta(minutes=15):
             app_state._last_schedule_attempt = sim_time

@@ -79,6 +79,11 @@ async def run_optimization(req: OptimizeRunRequest) -> dict[str, Any]:
         bat_cfg = await get_battery_settings()
         strat_cfg = await get_strategy_settings()
 
+        if req.horizon_h < 24 and horizon_start.hour > 0:
+            soc_end_target = min(soc_pct, max(bat_cfg.soc_min_pct, strat_cfg.reserve_soc_pct, 50.0))
+        else:
+            soc_end_target = soc_pct
+
         context = ScheduleContext(
             current_time=sim_now,
             horizon_start=horizon_start,
@@ -89,6 +94,7 @@ async def run_optimization(req: OptimizeRunRequest) -> dict[str, Any]:
             max_discharge_kw=bat_cfg.power_max_kw,
             soc_min_pct=bat_cfg.soc_min_pct,
             soc_max_pct=bat_cfg.soc_max_pct,
+            soc_end_target_pct=soc_end_target,
             reserve_soc_pct=strat_cfg.reserve_soc_pct,
             peak_limit_kw=strat_cfg.peak_limit_kw,
             prices=tariffs,

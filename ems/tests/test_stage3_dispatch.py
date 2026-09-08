@@ -401,3 +401,21 @@ class TestScheduleModel:
         assert db_dict["strategy"]["capacity_kwh"] == 1000.0
         assert len(db_dict["items"]) == 1
         assert db_dict["items"][0]["setpoint_kw"] == 500.0
+
+    def test_schedule_validity_covers_entire_last_hour(self) -> None:
+        """Schedule items cover up to ts + 1 hour, so 23:xx is covered by 23:00 item."""
+        base = datetime(2026, 3, 1, 23, 0, 0, tzinfo=UTC)
+        schedule = Schedule(
+            horizon_start=base.replace(hour=0),
+            horizon_end=base,
+            items=[ScheduleItem(ts=base, setpoint_kw=-250.0, reason="peak discharge")],
+        )
+        # At 23:00
+        assert schedule.get_setpoint_for(base) == -250.0
+        # At 23:30 (inside the 23:00 hour slot)
+        assert schedule.get_setpoint_for(base + timedelta(minutes=30)) == -250.0
+        # At 23:59:59 (still inside the 23:00 hour slot)
+        assert schedule.get_setpoint_for(base + timedelta(minutes=59, seconds=59)) == -250.0
+        # At 00:00 next day (outside the 23:00 hour slot)
+        assert schedule.get_setpoint_for(base + timedelta(hours=1)) is None
+

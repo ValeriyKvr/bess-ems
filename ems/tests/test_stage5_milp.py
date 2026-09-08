@@ -248,3 +248,35 @@ def test_strategy_factory_registry() -> None:
     for name in ["ARBITRAGE", "PEAK_SHAVING", "SELF_CONSUMPTION", "BACKUP_RESERVE", "TOU_SIMPLE"]:
         strat = get_strategy(name)
         assert strat.name == name
+
+
+def test_milp_intra_day_discharge_evening_peak() -> None:
+    """Intra-day horizon (13:00-23:00) with high initial SoC (80%) must discharge during peak hours."""
+    timestamps = [datetime(2026, 3, 1, h, 0, 0, tzinfo=UTC) for h in range(13, 24)]
+    # 13-17: mid price (5.0 UAH/kWh); 18-22: peak price (9.0 UAH/kWh); 23: 6.0 UAH/kWh
+    prices_buy = [5.0, 5.0, 5.0, 5.0, 5.0, 9.0, 9.0, 9.0, 9.0, 9.0, 6.0]
+    prices_sell = [p * 0.9 for p in prices_buy]
+
+    prob = OptimizationProblem(
+        timestamps=timestamps,
+        price_buy_uah_kwh=prices_buy,
+        price_sell_uah_kwh=prices_sell,
+        load_kw=[100.0] * len(timestamps),
+        pv_kw=[0.0] * len(timestamps),
+        capacity_kwh=1000.0,
+        max_charge_kw=500.0,
+        max_discharge_kw=500.0,
+        initial_soc_pct=80.0,
+        soc_min_pct=10.0,
+        soc_max_pct=90.0,
+        reserve_soc_pct=20.0,
+        export_allowed=True,
+        c_deg_uah_kwh=1.25,
+    )
+    schedule = solve(prob)
+    assert schedule.solver_status == "OPTIMAL"
+    # Verify that battery discharges during the evening peak
+    discharges = [item for item in schedule.items if item.setpoint_kw < 0]
+    assert len(discharges) > 0, "Intra-day schedule must discharge stored energy during evening peak"
+    assert schedule.expected_profit_uah is not None and schedule.expected_profit_uah > 0
+
