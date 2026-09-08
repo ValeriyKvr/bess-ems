@@ -363,6 +363,47 @@ Perfect Foresight    |  1,141,373.64 |    975,873.27 |    67,081.79 |  19.68 |  
 
 ## 10. Локальна розробка та тестування
 
+### 10.1. Запуск системи локально без Docker
+
+Систему можна запустити в 1 клік або вручну без Docker:
+
+#### Спосіб 1: Автоматичний запуск (скрипт)
+- **У Windows (подвійний клік або через консоль):**
+  ```bat
+  start-local.bat
+  ```
+  *(або через PowerShell: `.\start-local.ps1`)*
+- **Зупинка всіх локальних сервісів:**
+  ```bat
+  stop-local.bat
+  ```
+  *(або через PowerShell: `.\scripts\stop-local.ps1`)*
+
+#### Спосіб 2: Ручний запуск (4 окремі термінали)
+1. **MQTT Broker** (порт 1883):
+   ```bash
+   uv run --with amqtt amqtt
+   # (або запустіть встановлений Mosquitto: mosquitto -v)
+   ```
+2. **EMS Core** (FastAPI сервер, порт 8000):
+   ```bash
+   cd ems
+   uv run uvicorn ems.main:app --host 0.0.0.0 --port 8000
+   ```
+3. **BESS Simulator** (порт 5020 Modbus, підключення до MQTT):
+   ```bash
+   cd bess-sim
+   uv run python -m bess_sim.main
+   ```
+4. **Web Frontend** (порт 5173):
+   ```bash
+   cd web
+   pnpm dev
+   ```
+Після запуску відкрийте браузер: **http://localhost:5173**
+
+---
+
 ### Запуск тестів:
 ```bash
 # Тести EMS (52 тести: API, годинник, ринок, диспетчер, MILP, ML-фічі, звіти)

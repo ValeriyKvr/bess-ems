@@ -35,7 +35,72 @@ import ukTranslations from '../../i18n/uk.json';
 type MainTab = 'template' | 'historical' | 'strategies';
 type PeriodOption = 'today' | 'week' | 'month' | 'custom';
 
-export const ReportsPage: React.FC = () => {
+export const fmt = (val: number | undefined | null, fallback = '—'): string => {
+  if (val === undefined || val === null || isNaN(val)) return fallback;
+  return Number(val).toLocaleString();
+};
+
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+export class ReportsErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error('ReportsPage render error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-8 max-w-2xl mx-auto my-12 bg-slate-900 border border-rose-800/60 rounded-2xl text-center space-y-4 shadow-xl">
+          <div className="w-12 h-12 rounded-full bg-rose-950/80 border border-rose-700/60 text-rose-400 flex items-center justify-center mx-auto text-xl font-bold">
+            !
+          </div>
+          <h2 className="text-lg font-bold text-slate-100">
+            Помилка відображення сторінки звітів
+          </h2>
+          <p className="text-xs text-slate-400 font-mono bg-slate-950 p-3 rounded-lg border border-slate-800 text-rose-300">
+            {this.state.error?.message || 'Невідома помилка під час рендерингу'}
+          </p>
+          <div className="pt-2 flex justify-center gap-3">
+            <button
+              onClick={() => {
+                this.setState({ hasError: false, error: null });
+                window.location.reload();
+              }}
+              className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl text-xs font-semibold shadow-md transition-all"
+            >
+              Перезавантажити сторінку
+            </button>
+            <button
+              onClick={() => this.setState({ hasError: false, error: null })}
+              className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold transition-all"
+            >
+              Спробувати знову
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const ReportsContent: React.FC = () => {
   const t = ukTranslations.reports;
 
   const [activeTab, setActiveTab] = useState<MainTab>('template');
@@ -363,19 +428,19 @@ export const ReportsPage: React.FC = () => {
   // Render Template Performance & Savings Breakdown Chart
   useEffect(() => {
     if (activeTab !== 'template') return;
-    if (!templateChartRef.current || !templateReport || !templateReport.daily.length) return;
+    if (!templateChartRef.current || !templateReport || !templateReport.daily?.length) return;
     if (!templateChartInstance.current) {
       templateChartInstance.current = echarts.init(templateChartRef.current, 'dark');
     }
     const chart = templateChartInstance.current;
 
-    const dayLabels = templateReport.daily.map(
-      (d) => `Д${d.day_index} (${d.date.slice(5)})`
+    const dayLabels = (templateReport.daily || []).map(
+      (d) => `Д${d.day_index} (${(d.date || '').slice(5)})`
     );
-    const baseline = templateReport.daily.map((d) => d.baseline_cost_uah);
-    const actual = templateReport.daily.map((d) => d.actual_cost_uah);
-    const savings = templateReport.daily.map((d) => d.net_saving_uah);
-    const cycles = templateReport.daily.map((d) => d.cycles);
+    const baseline = (templateReport.daily || []).map((d) => d.baseline_cost_uah ?? 0);
+    const actual = (templateReport.daily || []).map((d) => d.actual_cost_uah ?? 0);
+    const savings = (templateReport.daily || []).map((d) => d.net_saving_uah ?? 0);
+    const cycles = (templateReport.daily || []).map((d) => d.cycles ?? 0);
 
     const option: echarts.EChartsOption = {
       backgroundColor: 'transparent',
@@ -626,7 +691,7 @@ export const ReportsPage: React.FC = () => {
                 <DollarSign className="w-4 h-4 text-amber-400" />
               </div>
               <div className="text-2xl font-bold font-mono text-slate-100">
-                {tmplKpi ? tmplKpi.baseline_cost_uah.toLocaleString() : '—'}{' '}
+                {tmplKpi ? fmt(tmplKpi.baseline_cost_uah) : '—'}{' '}
                 <span className="text-xs font-normal text-slate-400">грн</span>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">Витрати підприємства на імпорт за період</p>
@@ -639,7 +704,7 @@ export const ReportsPage: React.FC = () => {
                 <Scale className="w-4 h-4 text-cyan-400" />
               </div>
               <div className="text-2xl font-bold font-mono text-cyan-400">
-                {tmplKpi ? tmplKpi.actual_cost_uah.toLocaleString() : '—'}{' '}
+                {tmplKpi ? fmt(tmplKpi.actual_cost_uah) : '—'}{' '}
                 <span className="text-xs font-normal text-slate-400">грн</span>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">Оплата з урахуванням оптимізації заряд/розряд</p>
@@ -652,11 +717,11 @@ export const ReportsPage: React.FC = () => {
                 <TrendingUp className="w-4 h-4 text-emerald-400" />
               </div>
               <div className="text-2xl font-black font-mono text-emerald-400">
-                {tmplKpi ? `+${tmplKpi.net_savings_uah.toLocaleString()}` : '—'}{' '}
+                {tmplKpi ? `+${fmt(tmplKpi.net_savings_uah)}` : '—'}{' '}
                 <span className="text-xs font-semibold text-emerald-300">грн</span>
                 {tmplKpi && (
                   <span className="ml-2 text-sm font-bold text-emerald-300 bg-emerald-900/60 px-2 py-0.5 rounded border border-emerald-600/60">
-                    +{tmplKpi.savings_pct}%
+                    +{tmplKpi.savings_pct ?? 0}%
                   </span>
                 )}
               </div>
@@ -672,11 +737,11 @@ export const ReportsPage: React.FC = () => {
                 <BatteryCharging className="w-4 h-4 text-purple-400" />
               </div>
               <div className="text-2xl font-bold font-mono text-purple-400">
-                {tmplKpi ? tmplKpi.total_degradation_uah.toLocaleString() : '—'}{' '}
+                {tmplKpi ? fmt(tmplKpi.total_degradation_uah) : '—'}{' '}
                 <span className="text-xs font-normal text-slate-400">грн</span>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">
-                {tmplKpi ? `${tmplKpi.total_cycles} екв. циклів (~${(tmplKpi.total_cycles / (templateDays || 1)).toFixed(1)} ц/добу)` : 'Розрахунок зносу'}
+                {tmplKpi ? `${tmplKpi.total_cycles ?? 0} екв. циклів (~${((tmplKpi.total_cycles ?? 0) / (templateDays || 1)).toFixed(1)} ц/добу)` : 'Розрахунок зносу'}
               </p>
             </div>
           </div>
@@ -686,25 +751,25 @@ export const ReportsPage: React.FC = () => {
             <div className="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4">
               <div className="text-xs text-slate-400">Середня економія на добу</div>
               <div className="text-lg font-bold font-mono text-emerald-400 mt-1">
-                {tmplKpi ? `+${tmplKpi.avg_daily_savings_uah.toLocaleString()} грн/день` : '—'}
+                {tmplKpi ? `+${fmt(tmplKpi.avg_daily_savings_uah)} грн/день` : '—'}
               </div>
             </div>
             <div className="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4">
               <div className="text-xs text-slate-400">Прогноз економії на місяць (30 дн.)</div>
               <div className="text-lg font-bold font-mono text-emerald-400 mt-1">
-                {tmplKpi ? `+${(tmplKpi.avg_daily_savings_uah * 30).toLocaleString()} грн` : '—'}
+                {tmplKpi ? `+${fmt((tmplKpi.avg_daily_savings_uah ?? 0) * 30)} грн` : '—'}
               </div>
             </div>
             <div className="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4">
               <div className="text-xs text-slate-400">Прогноз економії на рік (365 дн.)</div>
               <div className="text-lg font-bold font-mono text-emerald-400 mt-1">
-                {tmplKpi ? `+${(tmplKpi.avg_daily_savings_uah * 365).toLocaleString()} грн` : '—'}
+                {tmplKpi ? `+${fmt((tmplKpi.avg_daily_savings_uah ?? 0) * 365)} грн` : '—'}
               </div>
             </div>
             <div className="bg-slate-900/70 border border-slate-800/80 rounded-xl p-4">
               <div className="text-xs text-slate-400">Зрізання піку з мережі (Peak Shaving)</div>
               <div className="text-lg font-bold font-mono text-cyan-400 mt-1">
-                {tmplKpi ? `-${tmplKpi.peak_shaving_kw} кВт (-${tmplKpi.peak_shaving_pct}%)` : '—'}
+                {tmplKpi ? `-${tmplKpi.peak_shaving_kw ?? 0} кВт (-${tmplKpi.peak_shaving_pct ?? 0}%)` : '—'}
               </div>
             </div>
           </div>
@@ -747,22 +812,22 @@ export const ReportsPage: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 font-mono">
-                  {templateReport?.daily.map((row) => (
+                  {templateReport?.daily?.map((row) => (
                     <tr key={row.day_index} className="hover:bg-slate-800/30 transition-colors">
                       <td className="px-3 py-2.5 font-bold text-cyan-400">День {row.day_index}</td>
                       <td className="px-3 py-2.5 text-slate-400">{row.date}</td>
-                      <td className="px-3 py-2.5">{row.baseline_cost_uah.toLocaleString()} грн</td>
-                      <td className="px-3 py-2.5 text-cyan-300">{row.actual_cost_uah.toLocaleString()} грн</td>
-                      <td className="px-3 py-2.5 text-purple-400">{row.degradation_uah.toLocaleString()} грн</td>
+                      <td className="px-3 py-2.5">{fmt(row.baseline_cost_uah)} грн</td>
+                      <td className="px-3 py-2.5 text-cyan-300">{fmt(row.actual_cost_uah)} грн</td>
+                      <td className="px-3 py-2.5 text-purple-400">{fmt(row.degradation_uah)} грн</td>
                       <td className="px-3 py-2.5 font-bold text-emerald-400">
-                        +{row.net_saving_uah.toLocaleString()} грн
+                        +{fmt(row.net_saving_uah)} грн
                       </td>
-                      <td className="px-3 py-2.5 text-emerald-300 font-bold">+{row.saving_pct}%</td>
-                      <td className="px-3 py-2.5">{row.charged_kwh.toLocaleString()} кВт·г</td>
-                      <td className="px-3 py-2.5">{row.discharged_kwh.toLocaleString()} кВт·г</td>
-                      <td className="px-3 py-2.5 text-slate-300">{row.cycles}</td>
+                      <td className="px-3 py-2.5 text-emerald-300 font-bold">+{row.saving_pct ?? 0}%</td>
+                      <td className="px-3 py-2.5">{fmt(row.charged_kwh)} кВт·г</td>
+                      <td className="px-3 py-2.5">{fmt(row.discharged_kwh)} кВт·г</td>
+                      <td className="px-3 py-2.5 text-slate-300">{row.cycles ?? 0}</td>
                       <td className="px-3 py-2.5 text-slate-400">
-                        {row.peak_reduction_kw > 0 ? `-${row.peak_reduction_kw} кВт` : '—'}
+                        {(row.peak_reduction_kw ?? 0) > 0 ? `-${row.peak_reduction_kw} кВт` : '—'}
                       </td>
                     </tr>
                   ))}
@@ -771,25 +836,25 @@ export const ReportsPage: React.FC = () => {
                   <tfoot className="bg-slate-950/90 font-mono font-bold text-slate-100 border-t border-slate-700">
                     <tr>
                       <td className="px-3 py-3" colSpan={2}>
-                        ВСЬОГО ЗА {templateReport?.analyzed_days} ДНІВ
+                        ВСЬОГО ЗА {templateReport?.analyzed_days ?? templateDays} ДНІВ
                       </td>
                       <td className="px-3 py-3 text-amber-400">
-                        {tmplKpi.baseline_cost_uah.toLocaleString()} грн
+                        {fmt(tmplKpi.baseline_cost_uah)} грн
                       </td>
                       <td className="px-3 py-3 text-cyan-300">
-                        {tmplKpi.actual_cost_uah.toLocaleString()} грн
+                        {fmt(tmplKpi.actual_cost_uah)} грн
                       </td>
                       <td className="px-3 py-3 text-purple-400">
-                        {tmplKpi.total_degradation_uah.toLocaleString()} грн
+                        {fmt(tmplKpi.total_degradation_uah)} грн
                       </td>
                       <td className="px-3 py-3 text-emerald-400">
-                        +{tmplKpi.net_savings_uah.toLocaleString()} грн
+                        +{fmt(tmplKpi.net_savings_uah)} грн
                       </td>
-                      <td className="px-3 py-3 text-emerald-300">+{tmplKpi.savings_pct}%</td>
-                      <td className="px-3 py-3">{tmplKpi.total_charged_kwh.toLocaleString()} кВт·г</td>
-                      <td className="px-3 py-3">{tmplKpi.total_discharged_kwh.toLocaleString()} кВт·г</td>
-                      <td className="px-3 py-3">{tmplKpi.total_cycles} ц</td>
-                      <td className="px-3 py-3 text-cyan-300">-{tmplKpi.peak_shaving_kw} кВт</td>
+                      <td className="px-3 py-3 text-emerald-300">+{tmplKpi.savings_pct ?? 0}%</td>
+                      <td className="px-3 py-3">{fmt(tmplKpi.total_charged_kwh)} кВт·г</td>
+                      <td className="px-3 py-3">{fmt(tmplKpi.total_discharged_kwh)} кВт·г</td>
+                      <td className="px-3 py-3">{tmplKpi.total_cycles ?? 0} ц</td>
+                      <td className="px-3 py-3 text-cyan-300">-{tmplKpi.peak_shaving_kw ?? 0} кВт</td>
                     </tr>
                   </tfoot>
                 )}
@@ -892,7 +957,7 @@ export const ReportsPage: React.FC = () => {
                 <DollarSign className="w-3.5 h-3.5 text-amber-400" />
               </div>
               <div className="text-xl font-bold font-mono text-slate-100">
-                {kpis ? kpis.total_cost_baseline_uah.toLocaleString() : '—'}{' '}
+                {kpis ? fmt(kpis.total_cost_baseline_uah) : '—'}{' '}
                 <span className="text-xs font-normal text-slate-400">грн</span>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">Витрати без наявності BESS</p>
@@ -904,7 +969,7 @@ export const ReportsPage: React.FC = () => {
                 <Scale className="w-3.5 h-3.5 text-cyan-400" />
               </div>
               <div className="text-xl font-bold font-mono text-cyan-400">
-                {kpis ? kpis.total_cost_actual_uah.toLocaleString() : '—'}{' '}
+                {kpis ? fmt(kpis.total_cost_actual_uah) : '—'}{' '}
                 <span className="text-xs font-normal text-slate-400">грн</span>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">Фактична оплата за імпорт</p>
@@ -920,7 +985,7 @@ export const ReportsPage: React.FC = () => {
                   (kpis?.net_benefit_uah || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'
                 }`}
               >
-                {kpis ? kpis.net_benefit_uah.toLocaleString() : '—'}{' '}
+                {kpis ? fmt(kpis.net_benefit_uah) : '—'}{' '}
                 <span className="text-xs font-normal text-slate-400">грн</span>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">Економія + Дохід - Деградація</p>
@@ -934,7 +999,7 @@ export const ReportsPage: React.FC = () => {
               <div className="text-xl font-bold font-mono text-purple-400">
                 {kpis?.payback_years ? `${kpis.payback_years} р.` : 'N/A'}{' '}
                 <span className="text-xs font-normal text-slate-400">
-                  ({kpis ? kpis.equivalent_cycles : '0'} циклів)
+                  ({kpis ? fmt(kpis.equivalent_cycles) : '0'} циклів)
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">Розрахунок від CAPEX BESS</p>
@@ -998,17 +1063,17 @@ export const ReportsPage: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60 font-mono">
-                {comparisonResults.map((row) => (
+                {comparisonResults?.map((row) => (
                   <tr key={row.strategy} className="hover:bg-slate-800/30">
                     <td className="px-3 py-2 font-bold text-cyan-300">{row.strategy}</td>
-                    <td className="px-3 py-2">{row.baseline_cost_uah.toLocaleString()} грн</td>
-                    <td className="px-3 py-2">{row.actual_cost_uah.toLocaleString()} грн</td>
+                    <td className="px-3 py-2">{fmt(row.baseline_cost_uah)} грн</td>
+                    <td className="px-3 py-2">{fmt(row.actual_cost_uah)} грн</td>
                     <td className="px-3 py-2 font-bold text-emerald-400">
-                      +{row.net_benefit_uah.toLocaleString()} грн
+                      +{fmt(row.net_benefit_uah)} грн
                     </td>
-                    <td className="px-3 py-2">{row.export_revenue_uah.toLocaleString()} грн</td>
-                    <td className="px-3 py-2 text-rose-400">{row.degradation_uah.toLocaleString()} грн</td>
-                    <td className="px-3 py-2">{row.equivalent_cycles}</td>
+                    <td className="px-3 py-2">{fmt(row.export_revenue_uah)} грн</td>
+                    <td className="px-3 py-2 text-rose-400">{fmt(row.degradation_uah)} грн</td>
+                    <td className="px-3 py-2">{row.equivalent_cycles ?? 0}</td>
                     <td className="px-3 py-2">
                       <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] text-slate-300">
                         {row.solver_status || 'OK'}
@@ -1025,4 +1090,10 @@ export const ReportsPage: React.FC = () => {
     </div>
   );
 };
+
+export const ReportsPage: React.FC = () => (
+  <ReportsErrorBoundary>
+    <ReportsContent />
+  </ReportsErrorBoundary>
+);
 

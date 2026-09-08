@@ -46,14 +46,22 @@ async def get_report_summary(
         except Exception:
             pass
 
-    stmt = select(Financial).order_by(Financial.ts.asc())
-    if start_dt:
-        stmt = stmt.where(Financial.ts >= start_dt)
-    if end_dt:
-        stmt = stmt.where(Financial.ts <= end_dt)
+    rows: list[Financial] = []
+    try:
+        if db is not None:
+            stmt = select(Financial).order_by(Financial.ts.asc())
+            if start_dt:
+                stmt = stmt.where(Financial.ts >= start_dt)
+            if end_dt:
+                stmt = stmt.where(Financial.ts <= end_dt)
 
-    res = await db.execute(stmt)
-    rows = list(res.scalars().all())
+            res = await db.execute(stmt)
+            rows = list(res.scalars().all())
+    except Exception as e:
+        logger.warning(
+            "Database unavailable in get_report_summary (%s) — returning summary with fallback.", e
+        )
+        rows = []
 
     # Calculate KPIs
     total_cost_baseline = sum(r.cost_baseline_uah for r in rows)
@@ -65,7 +73,12 @@ async def get_report_summary(
     total_import = sum(r.import_kwh for r in rows)
     total_export = sum(r.export_kwh for r in rows)
 
-    bat_cfg = await get_battery_settings(db)
+    try:
+        bat_cfg = await get_battery_settings(db)
+    except Exception:
+        from ems.api.settings import BatterySettings
+
+        bat_cfg = BatterySettings()
     capacity = bat_cfg.capacity_kwh if bat_cfg.capacity_kwh > 0 else 1000.0
     capex_uah = bat_cfg.capex_uah if bat_cfg.capex_uah > 0 else 15000000.0
 
@@ -289,18 +302,31 @@ async def compare_strategies(
     start_dt = datetime(d.year, d.month, d.day, 0, 0, tzinfo=UTC)
     end_dt = start_dt + timedelta(hours=23)
 
-    # 1. Fetch DAM prices and load from DB
-    stmt_p = (
-        select(DamPrice).where(DamPrice.ts >= start_dt, DamPrice.ts <= end_dt).order_by(DamPrice.ts)
-    )
-    res_p = await db.execute(stmt_p)
-    dam_rows = list(res_p.scalars().all())
+    dam_rows: list[DamPrice] = []
+    load_rows: list[SiteLoad] = []
+    try:
+        if db is not None:
+            stmt_p = (
+                select(DamPrice)
+                .where(DamPrice.ts >= start_dt, DamPrice.ts <= end_dt)
+                .order_by(DamPrice.ts)
+            )
+            res_p = await db.execute(stmt_p)
+            dam_rows = list(res_p.scalars().all())
 
-    stmt_l = (
-        select(SiteLoad).where(SiteLoad.ts >= start_dt, SiteLoad.ts <= end_dt).order_by(SiteLoad.ts)
-    )
-    res_l = await db.execute(stmt_l)
-    load_rows = list(res_l.scalars().all())
+            stmt_l = (
+                select(SiteLoad)
+                .where(SiteLoad.ts >= start_dt, SiteLoad.ts <= end_dt)
+                .order_by(SiteLoad.ts)
+            )
+            res_l = await db.execute(stmt_l)
+            load_rows = list(res_l.scalars().all())
+    except Exception as e:
+        logger.warning(
+            "Database unavailable in compare_strategies (%s) — using synthetic generator.", e
+        )
+        dam_rows = []
+        load_rows = []
 
     # If insufficient data in DB, synthesize 24h
     from ems.ingestion.generator import SyntheticDataGenerator
@@ -336,8 +362,19 @@ async def compare_strategies(
         load_list = [r.load_kw for r in load_rows[:24]]
         pv_list = [r.pv_kw for r in load_rows[:24]]
 
-    bat_cfg = await get_battery_settings(db)
-    strat_cfg = await get_strategy_settings(db)
+    try:
+        bat_cfg = await get_battery_settings(db)
+    except Exception:
+        from ems.api.settings import BatterySettings
+
+        bat_cfg = BatterySettings()
+
+    try:
+        strat_cfg = await get_strategy_settings(db)
+    except Exception:
+        from ems.api.settings import StrategySettings
+
+        strat_cfg = StrategySettings()
 
     strategy_names = [s.strip().upper() for s in strategies_str.split(",") if s.strip()]
     comparison_results: list[dict[str, Any]] = []
@@ -422,7 +459,15 @@ async def compare_strategies(
                     "error": str(e),
                     "baseline_cost_uah": 0.0,
                     "actual_cost_uah": 0.0,
+                    "net_savings_uah": 0.0,
+                    "export_revenue_uah": 0.0,
+                    "degradation_uah": 0.0,
                     "net_benefit_uah": 0.0,
+                    "total_charge_kwh": 0.0,
+                    "total_discharge_kwh": 0.0,
+                    "equivalent_cycles": 0.0,
+                    "solver_status": "ERROR",
+                    "solve_time_ms": 0,
                 }
             )
 
