@@ -37,3 +37,23 @@ def test_clock_pause_resume() -> None:
     assert not clock.is_paused
     clock.advance(60.0)
     assert clock.now() == datetime(2026, 3, 1, 0, 1, 0, tzinfo=UTC)
+
+
+def test_clock_cyclic_loop() -> None:
+    """Verify cyclic loop wraps around to loop start when reaching loop end."""
+    start = "2026-09-01T00:00:00Z"
+    clock = SimulationClock(start_time=start, speed=60)
+    clock.set_loop(enabled=True, start=start, duration_days=2)
+
+    assert clock.loop_enabled is True
+    assert clock.loop_start == datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC)
+    assert clock.loop_end == datetime(2026, 9, 3, 0, 0, 0, tzinfo=UTC)
+
+    # Advance 47 hours -> 2026-09-02 23:00:00
+    clock.advance(47 * 3600.0)
+    assert clock.now() == datetime(2026, 9, 2, 23, 0, 0, tzinfo=UTC)
+
+    # Advance 2 hours -> crosses 2026-09-03 00:00:00, wraps back to loop_start
+    clock.advance(2 * 3600.0)
+    assert clock.now() == datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC)
+

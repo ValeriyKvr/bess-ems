@@ -37,7 +37,7 @@ class EmsSettings(BaseSettings):
 
     # Simulation Clock (SPEC §4.2, §6.6)
     sim_speed: int = Field(default=60, alias="SIM_SPEED")
-    sim_start_time: str = Field(default="2026-03-01T00:00:00Z", alias="SIM_START_TIME")
+    sim_start_time: str = Field(default="2026-09-01T00:00:00Z", alias="SIM_START_TIME")
     sim_tick_seconds: int = Field(default=60, alias="SIM_TICK_SECONDS")
 
     # ML & Forecasting (SPEC §6.3, §8)

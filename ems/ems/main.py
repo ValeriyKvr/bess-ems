@@ -1041,6 +1041,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         # Auto-initialize schema and seed database if empty
         try:
+            from ems.core.templates import apply_template
             from ems.db.seed import ensure_db_initialized_and_seeded
 
             async with async_session_factory() as session:
@@ -1048,11 +1049,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
             bess_config_payload = await _load_runtime_settings()
 
-            # Preload telemetry cache & create Day 1 initial schedule
-            if app_state.clock:
-                start_dt = app_state.clock.now()
-                await preload_telemetry_cache(start_dt)
-                await _build_schedule_for_date(start_dt.date(), start_dt)
+            # Preload telemetry cache & create Day 1 initial schedule using default template
+            try:
+                await apply_template("enterprise_september_2026")
+                bess_config_payload = await _load_runtime_settings()
+            except Exception as tmpl_err:
+                logger.warning("Auto-applying template error: %s", tmpl_err)
+                if app_state.clock:
+                    start_dt = app_state.clock.now()
+                    await preload_telemetry_cache(start_dt)
+                    await _build_schedule_for_date(start_dt.date(), start_dt)
         except Exception as seed_err:
             logger.warning("Auto-seed or schedule initialization error: %s", seed_err)
 

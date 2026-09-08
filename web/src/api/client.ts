@@ -1,4 +1,12 @@
-import { SystemStatus, HealthResponse, MlModelInfo, ForecastPoint, BacktestResult } from '../types';
+import {
+  SystemStatus,
+  HealthResponse,
+  MlModelInfo,
+  ForecastPoint,
+  BacktestResult,
+  SimulationTemplate,
+  TemplateReportResponse,
+} from '../types';
 
 /**
  * FastAPI returns `detail` either as a string or as a list of validation objects.
@@ -330,5 +338,96 @@ export async function fetchScheduleById(
   }
   return response.json();
 }
+
+// ── Simulation Templates & Loop API ──────────────────────────────────────────
+
+export async function fetchTemplates(): Promise<SimulationTemplate[]> {
+  const response = await fetch('/api/sim/templates');
+  if (!response.ok) {
+    throw new Error(`Failed to fetch simulation templates: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function fetchTemplateById(id: string): Promise<SimulationTemplate> {
+  const response = await fetch(`/api/sim/templates/${id}`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch template ${id}: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function saveTemplate(
+  template: SimulationTemplate
+): Promise<{ status: string; template: SimulationTemplate }> {
+  const response = await fetch('/api/sim/templates', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(template),
+  });
+  if (!response.ok) {
+    throw new Error(await errorText(response, 'Failed to save template'));
+  }
+  return response.json();
+}
+
+export async function applyTemplate(
+  id: string,
+  loopDays?: number
+): Promise<{
+  status: string;
+  template: SimulationTemplate;
+  effective_loop_days: number;
+  loop_start: string;
+  loop_end: string;
+}> {
+  const response = await fetch(`/api/sim/templates/${id}/apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ loop_days: loopDays }),
+  });
+  if (!response.ok) {
+    throw new Error(await errorText(response, `Failed to apply template ${id}`));
+  }
+  return response.json();
+}
+
+export async function fetchTemplateReport(
+  id: string,
+  days?: number
+): Promise<TemplateReportResponse> {
+  const url = days
+    ? `/api/sim/templates/${id}/report?days=${days}`
+    : `/api/sim/templates/${id}/report`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch template report: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function controlSimulationLoop(payload: {
+  enabled: boolean;
+  start?: string;
+  end?: string;
+  days?: number;
+}): Promise<{ status: string; clock: any }> {
+  const response = await fetch('/api/sim/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'loop',
+      loop_enabled: payload.enabled,
+      loop_start: payload.start,
+      loop_end: payload.end,
+      loop_days: payload.days,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(await errorText(response, 'Failed to update simulation loop'));
+  }
+  return response.json();
+}
+
 
 

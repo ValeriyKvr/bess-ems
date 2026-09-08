@@ -128,6 +128,96 @@ async def seed_ml_models_if_empty(session: AsyncSession) -> None:
     await session.commit()
 
 
+async def seed_september_2026_enterprise_data(session: AsyncSession) -> None:
+    """Seed real Ukrainian DAM market prices and enterprise site load for 01-09 September 2026."""
+    from datetime import timedelta
+
+    import numpy as np
+
+    start_sept = datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC)
+    end_sept = datetime(2026, 9, 9, 23, 0, 0, tzinfo=UTC)
+
+    # 1. Check if September 2026 DAM prices exist
+    p_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(DamPrice)
+            .where(DamPrice.ts >= start_sept, DamPrice.ts <= end_sept)
+        )
+    ).scalar_one()
+
+    if p_count < 216:
+        logger.info("Seeding September 2026 real DAM prices (current count: %d)...", p_count)
+        candidates = [
+            Path(__file__).resolve().parent.parent.parent / "data" / "samples" / "dam_prices_september_2026.csv",
+            Path(__file__).resolve().parent.parent / "ingestion" / "dam_prices_september_2026.csv",
+            Path(__file__).resolve().parent.parent.parent.parent / "data" / "samples" / "dam_prices_september_2026.csv",
+        ]
+        csv_file = next((p for p in candidates if p.exists()), None)
+        if csv_file:
+            import pandas as pd
+
+            df = pd.read_csv(csv_file)
+            records = []
+            for _, r in df.iterrows():
+                dt = datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00"))
+                records.append({
+                    "ts": dt,
+                    "price_uah_mwh": float(r["price_uah_mwh"]),
+                    "volume_mwh": float(r.get("volume_mwh", 1500.0)),
+                })
+            for i in range(0, len(records), 500):
+                batch = records[i : i + 500]
+                stmt = insert(DamPrice).values(batch).on_conflict_do_nothing()
+                await session.execute(stmt)
+            logger.info("Inserted %d September 2026 real DAM prices.", len(records))
+
+    # 2. Check if September 2026 site load exists
+    l_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(SiteLoad)
+            .where(SiteLoad.ts >= start_sept, SiteLoad.ts <= end_sept)
+        )
+    ).scalar_one()
+
+    if l_count < 216:
+        logger.info("Seeding September 2026 enterprise site load (current count: %d)...", l_count)
+        records = []
+        cur = start_sept
+        np.random.seed(42)
+        while cur <= end_sept:
+            h = cur.hour
+            # Enterprise load: 200-300 kW daytime (07-23), 0-100 kW nighttime (23-07)
+            if 7 <= h < 23:
+                base_load = 250.0 + float(np.random.uniform(-40.0, 45.0))
+            else:
+                base_load = 50.0 + float(np.random.uniform(-35.0, 45.0))
+            base_load = max(5.0, base_load)
+
+            # Solar PV: 50-150 kW peak daytime
+            if 8 <= h <= 17:
+                solar_frac = np.sin(np.pi * (h - 7) / 11)
+                pv = max(0.0, float(140.0 * solar_frac + np.random.uniform(-10.0, 10.0)))
+            else:
+                pv = 0.0
+
+            records.append({
+                "ts": cur,
+                "load_kw": round(base_load, 2),
+                "pv_kw": round(pv, 2),
+            })
+            cur += timedelta(hours=1)
+
+        for i in range(0, len(records), 500):
+            batch = records[i : i + 500]
+            stmt = insert(SiteLoad).values(batch).on_conflict_do_nothing()
+            await session.execute(stmt)
+        logger.info("Inserted %d September 2026 enterprise site load records.", len(records))
+
+    await session.commit()
+
+
 async def ensure_db_initialized_and_seeded(session: AsyncSession, seed: int = 42) -> bool:
     """Create all tables if not exist and seed default settings, models & synthetic data."""
     try:
@@ -138,5 +228,7 @@ async def ensure_db_initialized_and_seeded(session: AsyncSession, seed: int = 42
         logger.warning("Schema creation warning (may already exist): %s", e)
 
     seeded = await seed_database_if_empty(session, seed=seed)
+    await seed_september_2026_enterprise_data(session)
     await seed_ml_models_if_empty(session)
     return seeded
+

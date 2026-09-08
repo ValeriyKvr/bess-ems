@@ -2,6 +2,9 @@ export interface ClockStatus {
   ts_sim: string;
   speed: number;
   is_paused: boolean;
+  loop_enabled?: boolean;
+  loop_start?: string;
+  loop_end?: string;
 }
 
 export interface SystemStatus {
@@ -267,5 +270,75 @@ export interface PaginatedDispatchLogResponse {
   page: number;
   limit: number;
 }
+
+export interface SimulationTemplate {
+  id: string;
+  name: string;
+  description: string;
+  start_time: string;
+  duration_days: number;
+  loop_cyclic: boolean;
+  default_loop_days: number;
+  max_loop_days: number;
+  battery_capacity_kwh: number;
+  battery_power_kw: number;
+  soc_min_pct: number;
+  soc_max_pct: number;
+  reserve_soc_pct: number;
+  initial_soc_pct: number;
+  site_day_load_kw: number;
+  site_night_load_kw: number;
+  pv_peak_kw: number;
+  strategy: string;
+  price_source: string;
+  is_default: boolean;
+}
+
+export interface DailyReportItem {
+  date: string;
+  day_index: number;
+  baseline_cost_uah: number;
+  actual_cost_uah: number;
+  degradation_uah: number;
+  net_saving_uah: number;
+  saving_pct: number;
+  cycles: number;
+  charged_kwh: number;
+  discharged_kwh: number;
+  baseline_peak_kw: number;
+  actual_peak_kw: number;
+  peak_reduction_kw: number;
+}
+
+export interface TemplateReportKPI {
+  baseline_cost_uah: number;
+  actual_cost_uah: number;
+  net_savings_uah: number;
+  savings_pct: number;
+  total_degradation_uah: number;
+  total_charged_kwh: number;
+  total_discharged_kwh: number;
+  total_cycles: number;
+  avg_daily_savings_uah: number;
+  peak_shaving_kw: number;
+  peak_shaving_pct: number;
+  total_load_kwh: number;
+  total_pv_kwh: number;
+}
+
+export interface TemplateReportResponse {
+  template_id: string;
+  template_name: string;
+  analyzed_days: number;
+  start_date: string;
+  end_date: string;
+  battery: {
+    capacity_kwh: number;
+    power_kw: number;
+  };
+  kpi: TemplateReportKPI;
+  daily: DailyReportItem[];
+}
+
 
 

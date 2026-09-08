@@ -19,6 +19,7 @@ interface TelemetryState {
   stepSim: (seconds?: number) => Promise<void>;
   jumpTo: (target: string | { hour: number; minute?: number }) => Promise<void>;
   seekTime: (hour: number, minute?: number) => Promise<void>;
+  setLoop: (enabled: boolean, loopDays?: number, start?: string) => Promise<void>;
   fetchLatestSchedule: () => Promise<void>;
   fetchRecentEvents: () => Promise<void>;
 }
@@ -211,6 +212,23 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => ({
 
   seekTime: async (hour: number, minute = 0) => {
     return get().jumpTo({ hour, minute });
+  },
+
+  setLoop: async (enabled: boolean, loopDays?: number, start?: string) => {
+    try {
+      await fetch('/api/sim/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'loop',
+          loop_enabled: enabled,
+          loop_days: loopDays,
+          loop_start: start,
+        }),
+      });
+    } catch (err) {
+      console.error('Failed to set loop:', err);
+    }
   },
 
   fetchLatestSchedule: async () => {

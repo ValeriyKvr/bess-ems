@@ -9,7 +9,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 SCENARIOS: dict[str, str] = {
-    "default": "2026-03-01T00:00:00Z",
+    "default": "2026-09-01T00:00:00Z",
+    "september_2026": "2026-09-01T00:00:00Z",
+    "march_baseline": "2026-03-01T00:00:00Z",
     "winter_week": "2025-01-13T00:00:00Z",
     "summer_month": "2025-07-01T00:00:00Z",
     "year_2025": "2025-01-01T00:00:00Z",
@@ -36,12 +38,17 @@ class SimulationClock:
         elif isinstance(start_time, datetime):
             self._current_time = start_time if start_time.tzinfo else start_time.replace(tzinfo=UTC)
         else:
-            self._current_time = datetime(2026, 3, 1, 0, 0, 0, tzinfo=UTC)
+            self._current_time = datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC)
 
         self._speed = speed if speed in self.ALLOWED_SPEEDS else 60
         self._is_paused = self._speed == 0
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
+
+        # Cyclic loop configuration (default: 9 days window)
+        self._loop_enabled: bool = True
+        self._loop_start: datetime = self._current_time
+        self._loop_end: datetime = self._current_time + timedelta(days=9)
 
         # Listeners for clock events
         self._tick_callbacks: list[Callable[[datetime, float], Any]] = []
@@ -59,6 +66,51 @@ class SimulationClock:
     def now_iso(self) -> str:
         """Get current simulation timestamp formatted as ISO 8601 string."""
         return self._current_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @property
+    def loop_enabled(self) -> bool:
+        """Check if cyclic looping is enabled."""
+        return self._loop_enabled
+
+    @property
+    def loop_start(self) -> datetime:
+        """Simulation loop start timestamp."""
+        return self._loop_start
+
+    @property
+    def loop_end(self) -> datetime:
+        """Simulation loop end timestamp."""
+        return self._loop_end
+
+    def set_loop(
+        self,
+        enabled: bool,
+        start: datetime | str | None = None,
+        end: datetime | str | None = None,
+        duration_days: int | None = None,
+    ) -> None:
+        """Configure simulation cyclic looping parameters."""
+        self._loop_enabled = enabled
+        if start is not None:
+            if isinstance(start, str):
+                self._loop_start = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            else:
+                self._loop_start = start if start.tzinfo else start.replace(tzinfo=UTC)
+
+        if end is not None:
+            if isinstance(end, str):
+                self._loop_end = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            else:
+                self._loop_end = end if end.tzinfo else end.replace(tzinfo=UTC)
+        elif duration_days is not None:
+            self._loop_end = self._loop_start + timedelta(days=duration_days)
+
+        logger.info(
+            "Simulation loop configured: enabled=%s, start=%s, end=%s",
+            self._loop_enabled,
+            self._loop_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            self._loop_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
 
     @property
     def speed(self) -> int:
@@ -120,6 +172,8 @@ class SimulationClock:
         else:
             self.jump_to(SCENARIOS["default"])
         self._d13_triggered_for_date.clear()
+        self._loop_start = self._current_time
+        self._loop_end = self._current_time + timedelta(days=9)
         logger.info("Simulation clock reset to scenario '%s': %s", scenario, self.now_iso())
 
     def advance(self, delta_seconds: float, force: bool = False) -> datetime:
@@ -129,6 +183,24 @@ class SimulationClock:
 
         prev_time = self._current_time
         self._current_time += timedelta(seconds=delta_seconds)
+
+        # Check cyclic loop wrap-around
+        if (
+            self._loop_enabled
+            and self._loop_end
+            and self._loop_start
+            and self._loop_end > self._loop_start
+            and self._current_time >= self._loop_end
+        ):
+            logger.info(
+                "Simulation reached loop end %s, wrapping back to loop start %s",
+                self._current_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                self._loop_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+            self._current_time = self._loop_start
+            self._last_hour = self._current_time.hour
+            self._last_day = self._current_time.date()
+            self._d13_triggered_for_date.clear()
 
         # Detect hour transition
         if self._current_time.hour != prev_time.hour:
@@ -186,6 +258,9 @@ class SimulationClock:
             "ts_sim": self.now_iso(),
             "speed": self._speed,
             "is_paused": self._is_paused,
+            "loop_enabled": self._loop_enabled,
+            "loop_start": self._loop_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "loop_end": self._loop_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
 
     async def start_loop(

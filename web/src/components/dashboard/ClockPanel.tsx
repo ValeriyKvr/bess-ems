@@ -1,6 +1,23 @@
 import { useState, useRef, useEffect } from 'react';
-import { Clock, Play, Pause, StepForward, TrendingUp, TrendingDown, Sun, Moon, Zap, Activity } from 'lucide-react';
+import {
+  Clock,
+  Play,
+  Pause,
+  StepForward,
+  TrendingUp,
+  TrendingDown,
+  Sun,
+  Moon,
+  Zap,
+  Activity,
+  Layers,
+  RotateCcw,
+  Sparkles,
+  FileText,
+} from 'lucide-react';
 import { useTelemetryStore } from '../../stores/telemetryStore';
+import { fetchTemplates, applyTemplate } from '../../api/client';
+import { SimulationTemplate } from '../../types';
 
 export function ClockPanel() {
   const { currentTick, setSpeed, pauseSim, resumeSim, stepSim, jumpTo } = useTelemetryStore();
@@ -8,10 +25,44 @@ export function ClockPanel() {
   const clock = currentTick?.clock;
   const isPaused = clock?.is_paused ?? false;
   const currentSpeed = clock?.speed ?? 60;
-  const rawSimTime = clock?.ts_sim ?? '2026-03-02T08:15:00Z';
+  const rawSimTime = clock?.ts_sim ?? '2026-09-01T08:15:00Z';
+
+  // Template and cyclic loop state
+  const [templates, setTemplates] = useState<SimulationTemplate[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>('enterprise_september_2026');
+  const [loopDays, setLoopDays] = useState<number>(9);
+  const [isApplying, setIsApplying] = useState<boolean>(false);
+  const [applySuccess, setApplySuccess] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchTemplates()
+      .then((data) => {
+        if (data && data.length > 0) {
+          setTemplates(data);
+          const defaultT = data.find((t) => t.is_default) || data[0];
+          setSelectedTemplateId(defaultT.id);
+          setLoopDays(defaultT.default_loop_days);
+        }
+      })
+      .catch((err) => console.debug('Failed to fetch templates:', err));
+  }, []);
+
+  const handleApplyTemplate = async () => {
+    setIsApplying(true);
+    setApplySuccess(null);
+    try {
+      await applyTemplate(selectedTemplateId, loopDays);
+      setApplySuccess('Шаблон активовано!');
+      setTimeout(() => setApplySuccess(null), 3000);
+    } catch (err) {
+      console.error('Failed to apply template:', err);
+    } finally {
+      setIsApplying(false);
+    }
+  };
 
   // Format UTC date & time
-  let formattedDate = '02.03.2026';
+  let formattedDate = '01.09.2026';
   let formattedTime = '08:15:00';
   let serverMinutes = 8 * 60 + 15;
 
@@ -201,6 +252,83 @@ export function ClockPanel() {
               <span className="font-mono font-semibold text-slate-200">{priceSell.toFixed(0)}</span>
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Template Selection & Cyclic Loop Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-2 rounded-xl bg-slate-950/70 border border-slate-800 text-xs">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2 text-slate-300">
+            <Layers className="w-4 h-4 text-cyan-400" />
+            <span className="font-semibold text-slate-400">Шаблон:</span>
+            <select
+              value={selectedTemplateId}
+              onChange={(e) => {
+                const newId = e.target.value;
+                setSelectedTemplateId(newId);
+                const found = templates.find((t) => t.id === newId);
+                if (found) setLoopDays(found.default_loop_days);
+              }}
+              className="bg-slate-900 border border-slate-700 text-slate-100 rounded-lg px-2.5 py-1 text-xs focus:outline-none focus:border-cyan-500 font-medium"
+            >
+              {templates.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="flex items-center gap-1.5 text-slate-400">
+            <RotateCcw className="w-3.5 h-3.5 text-blue-400" />
+            <span>Цикл:</span>
+            <div className="flex items-center gap-1">
+              {[1, 3, 7, 9].map((d) => (
+                <button
+                  key={d}
+                  onClick={() => setLoopDays(d)}
+                  className={`px-2 py-0.5 rounded text-xs font-mono transition-all ${
+                    loopDays === d
+                      ? 'bg-blue-600 text-white font-bold shadow-sm shadow-blue-600/30'
+                      : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                  }`}
+                >
+                  {d}д
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <button
+            onClick={handleApplyTemplate}
+            disabled={isApplying}
+            className="px-3 py-1 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white font-medium flex items-center gap-1 transition-all shadow-sm shadow-cyan-600/20"
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>{isApplying ? 'Застосування...' : 'Застосувати'}</span>
+          </button>
+
+          {applySuccess && (
+            <span className="text-emerald-400 text-[11px] font-medium">
+              ✓ {applySuccess}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5 text-[11px] text-slate-400 font-mono">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span>
+              {clock?.loop_enabled ? `Цикл: ${loopDays} дн. (активно)` : 'Цикл вимкнено'}
+            </span>
+          </div>
+          <a
+            href="#reports"
+            className="px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 flex items-center gap-1.5 transition-all text-[11px] font-medium"
+          >
+            <FileText className="w-3.5 h-3.5 text-amber-400" />
+            <span>Звіт по економії</span>
+          </a>
         </div>
       </div>
 
